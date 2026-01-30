@@ -5,10 +5,9 @@ use std::path::Path;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 
+use crate::arithmetic::utils::{Logarithm, rand_int};
 #[cfg(feature = "verbose")]
 use crate::utils::verbose::progress_bar;
-
-use crate::arithmetic::{RandFromRng, Logarithm};
 
 // bytes per integer
 const INT_WIDTH: usize = 4;
@@ -44,7 +43,7 @@ pub fn write_random_data(
     for rep in 0..reps {
         // Fill the array
         for i in 0..arr.len() {
-            arr[i] = u64::rand((q, q.log()), &mut rng);
+            arr[i] = rand_int(q, q.log(), &mut rng);
         }
 
         // Iterate over every element and convert it to 4 bytes
