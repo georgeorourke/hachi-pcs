@@ -1,6 +1,6 @@
 use ark_ff::{AdditiveGroup, BigInteger, Field, PrimeField};
 
-use crate::arithmetic::{ExtField, FieldExtension, Serialise};
+use crate::arithmetic::{ExtField, fs::Serialise, utils::lift_int};
 
 /// Representation of a polynomial that can be used for sum check.
 /// The polynomial must have at most 64 variables.
@@ -27,6 +27,7 @@ pub struct Univariate<F : Field> {
     evals: Vec<F>
 }
 
+/// Implement the univariate polynomial for the extension field.
 impl Univariate<ExtField> {
     pub fn init(evals: Vec<ExtField>) -> Self {
         Self { evals }
@@ -47,8 +48,8 @@ impl Univariate<ExtField> {
 
             for j in 0..n {
                 if i != j {
-                    let x_i = ExtField::lift_int(i as u64);
-                    let x_j = ExtField::lift_int(j as u64);
+                    let x_i = lift_int(i as u64);
+                    let x_j = lift_int(j as u64);
                     l_i *= (x - x_j) * (x_i - x_j).inverse().unwrap();
                 }
             }
@@ -60,6 +61,7 @@ impl Univariate<ExtField> {
     }
 }
 
+/// Implement the serialise trait for the univariate polynomial over the extension field.
 impl Serialise for Univariate<ExtField> {
     fn serialise(&self) -> Vec<u8> {
         let mut bytes = Vec::<u8>::new();
@@ -73,17 +75,6 @@ impl Serialise for Univariate<ExtField> {
 
         bytes
     }
-}
-
-/// Equality function on two field elements.
-pub fn eq(a: ExtField, b: ExtField) -> ExtField {
-    a * b + (ExtField::ONE - a) * (ExtField::ONE - b)
-}
-
-/// Equality function on field element and binary element.
-pub fn eq_bin(a: ExtField, bin: usize) -> ExtField {
-    if bin == 1 { a }
-    else { ExtField::ONE - a }
 }
 
 /// Given a function table on boolean hypercube, fix the first variable

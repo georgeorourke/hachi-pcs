@@ -1,9 +1,7 @@
+/// Definition of fields provided by arkworks.
+
 use ark_ff::fields::{Fp, Fp2, Fp2Config, Fp4, Fp4Config, MontBackend, MontConfig};
-use ark_ff::{AdditiveGroup, BigInt, Field};
-
-use rand::RngCore;
-
-use crate::arithmetic::{CoeffType, FieldExtension, RandFromRng};
+use ark_ff::BigInt;
 
 // ---- The base prime field Zq ---- //
 #[derive(MontConfig)]
@@ -47,30 +45,6 @@ impl Fp4Config for Fq4Config {
 
 pub type Fq4 = Fp4<Fq4Config>;
 
-/// Random sample element of Fq4.
-impl RandFromRng<CoeffType> for Fq4 {
-    fn rand(_q: CoeffType, rng: &mut impl RngCore) ->  Self {
-        // q is hardcoded in this implementation
-        let a = u64::rand((4294967197, 32), rng);
-        let b = u64::rand((4294967197, 32), rng);
-        let c = u64::rand((4294967197, 32), rng);
-        let d = u64::rand((4294967197, 32), rng);
-
-        Fq4::new(Fq2::new(Fq::from(a), Fq::from(b)), Fq2::new(Fq::from(c), Fq::from(d)))
-    }
-}
-
-/// Implement field extension operations for Fq4.
-impl FieldExtension for Fq4 {
-    fn lift_int(x: CoeffType) -> Self {
-        Fq4::new(Fq2::new(Fq::from(x as i64), Fq::ZERO), Fq2::ZERO)
-    }
-
-    fn mul_int(&self, x: CoeffType) -> Self {
-        self.mul_by_base_prime_field(&Fq::from(x))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,19 +83,5 @@ mod tests {
         
         assert_eq!(sum, c+d);
         assert_eq!(prod, c*d);
-    }
-
-    #[test]
-    fn test_int_mul_field() {
-        let x = 101;
-
-        let a = Fq2::new(Fq::from(10), Fq::from(50));
-        let b = Fq2::new(Fq::from(30), Fq::from(-8));
-        let f = Fq4::new(a, b);
-
-        let expected = Fq4::new(Fq2::new(Fq::from(x), Fq::ZERO), Fq2::ZERO) * f;
-        let actual = f.mul_int(x);
-        
-        assert_eq!(expected, actual);
     }
 }

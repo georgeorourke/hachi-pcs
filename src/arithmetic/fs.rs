@@ -1,7 +1,11 @@
 use sha256::digest;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 
-use crate::arithmetic::Serialise;
+/// Object can be serialised.
+pub trait Serialise {
+    /// Represent the object as a byte array.
+    fn serialise(&self) -> Vec<u8>;
+}
 
 /// Structure used to perform FS transform.
 pub struct FS {

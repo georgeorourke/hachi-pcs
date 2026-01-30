@@ -9,13 +9,13 @@ use crate::utils::gen_file::write_random_data;
 use crate::stream::Stream;
 use crate::stream::file_stream::U64FileStream;
 
+use crate::arithmetic::utils::multi_lin_coeff_int;
+
 use crate::hachi::Hachi;
 use crate::hachi::setup::Setup;
 use crate::hachi::commit::Commit;
-use crate::hachi::evaluate::Evaluate;
+use crate::hachi::prove::Prove;
 use crate::hachi::verify::Verify;
-
-use crate::arithmetic::MultiLinearCoeff;
 
 fn main() {
     time_graph::enable_data_collection(true);
@@ -38,7 +38,7 @@ fn main() {
 
     // create an evaluation point and run the evaluation proof
     let x = vec![1234; params.l];
-    let proof = Hachi::evaluate(&mut witness, &params, &x, &com);
+    let proof = Hachi::prove(&mut witness, &params, &x, &com);
 
     // compute claimed evaluation
     println!("\nCalculating evaluation...");
@@ -54,7 +54,7 @@ fn main() {
         witness.read(&mut buf);
 
         for j in 0..1 << r {
-            let a = u64::multi_lin_coeff(&x, i << r | j, params.l, params.q);
+            let a = multi_lin_coeff_int(&x, i << r | j, params.l, params.q);
             y = (y + a * buf[j]) % params.q;
         }
     }

@@ -1,6 +1,18 @@
 use ark_ff::AdditiveGroup;
 
-use crate::arithmetic::{CoeffType, ExtField, FieldExtension, Poly};
+use crate::arithmetic::{CoeffType, ExtField};
+use crate::arithmetic::utils::mul_int_field;
+
+/// Object represents a polynomial stored in coefficient form.
+pub trait Poly {
+    /// Evaluate the polynomial at a given extension field element alpha in
+    /// given the powers [1, alpha, alpha^2 ... alpha^(d-1)].
+    fn eval(&self, alpha_pows: &[ExtField]) -> ExtField;
+
+    /// Divide by X^d+1 mod q and store quotient and remainder.
+    /// Assume the polynomial is of length 2d.
+    fn cyclotomic_div(&self, q: CoeffType, quotient: &mut [CoeffType], remainder: &mut [CoeffType]);
+}
 
 /// Implementation of Poly for a slice of unsinged 64 bit integers.
 impl Poly for &[u64] {
@@ -8,7 +20,7 @@ impl Poly for &[u64] {
         let mut out = ExtField::ZERO;
 
         for i in 0..self.len() {
-            out += alpha_pows[i].mul_int(self[i]);
+            out += mul_int_field(self[i], alpha_pows[i]);
         }
 
         out
@@ -54,7 +66,7 @@ mod test_poly {
 
         for i in 0..8 {
             pows.push(alpha.pow([i]));
-            expected += alpha.pow([i]).mul_int(poly[i as usize]);
+            expected += mul_int_field(poly[i as usize], alpha.pow([i]));
         }
 
         // evaluate the polynomial

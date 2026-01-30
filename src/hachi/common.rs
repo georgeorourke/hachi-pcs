@@ -1,6 +1,10 @@
 use ark_ff::AdditiveGroup;
 
-use crate::arithmetic::{ExtField, FieldExtension, Logarithm, MultiLinearCoeff, PChal, PMat, Poly, RandFromSeed, gadget};
+use crate::arithmetic::utils::{Logarithm, gadget, lift_int, mul_int_field, multi_lin_coeff_int};
+use crate::arithmetic::poly_mat::PMat;
+use crate::arithmetic::poly_chal::PChal;
+use crate::arithmetic::ExtField;
+use crate::arithmetic::poly::Poly;
 
 use crate::hachi::setup::Parameters;
 
@@ -14,13 +18,13 @@ pub fn form_m_alpha(
 ) -> Vec<ExtField>
 {
     if params.reuse_mats {
-        let mat = PMat::rand((params.n, params.width_d, params.d, params.q), params.d_seed);
+        let mat = PMat::rand(params.n, params.width_d, params.d, params.q, params.d_seed);
         form_m_alpha_same_matrix(params, x, challenges, alpha_pows, &mat)
     }
     else {
-        let mat_a = PMat::rand((params.n, params.width_a, params.d, params.q), params.a_seed);
-        let mat_b = PMat::rand((params.n, params.width_b, params.d, params.q), params.b_seed);
-        let mat_d = PMat::rand((params.n, params.width_d, params.d, params.q), params.d_seed);
+        let mat_a = PMat::rand(params.n, params.width_a, params.d, params.q, params.a_seed);
+        let mat_b = PMat::rand(params.n, params.width_b, params.d, params.q, params.b_seed);
+        let mat_d = PMat::rand(params.n, params.width_d, params.d, params.q, params.d_seed);
         form_m_alpha_different_matrices(params, x, challenges, alpha_pows, &mat_a, &mat_b, &mat_d)
     }
 }
@@ -38,8 +42,8 @@ pub fn form_m_alpha_different_matrices(
 ) -> Vec<ExtField>
 {
     // We are constructing M (evaluated at alpha) such that M.[z|r] = y.
-    // M'.z = y + (X^d-1).r where M' is the verification matrix for equations from previous part of the protocol.
-    // So M = [M' | (-X^d-1).In], and padded with zeros so its height and width are powers of two.
+    // M'.z = y + (X^d+1).G_n.r where M' is the verification matrix for equations from previous part of the protocol.
+    // So M = [M' | (-X^d+1).Gn], and padded with zeros so its height and width are powers of two.
 
     // length of z (width of M')
     let mu = params.width_d + params.width_b + params.width_a * params.delta_z;
@@ -47,9 +51,9 @@ pub fn form_m_alpha_different_matrices(
     // length of r (height of M')
     let n = params.n + params.n + 1 + 1 + params.n;
 
-    // pad n and (mu + n) to the next power of two
+    // pad n and (mu + n*delta) to the next power of two
     let height = 1 << (n.log());
-    let width = 1 << ((mu + n).log());
+    let width = 1 << ((mu + n * params.delta).log());
 
     // create the vector of evaluations of M_alpha_mle
     let mut evals = vec![ExtField::ZERO; height * width];
@@ -86,11 +90,11 @@ pub fn form_m_alpha_different_matrices(
 
     for i in 0..1 << params.r {
         // get the current coefficient
-        let b_i = u64::multi_lin_coeff(&x[0..params.r], i, params.r, params.q);
+        let b_i = multi_lin_coeff_int(&x[0..params.r], i, params.r, params.q);
 
         // expand with gadget vector
         for j in 0..params.delta {
-            let f = ExtField::lift_int(b_i * gadget_vec[j]);
+            let f = lift_int(b_i * gadget_vec[j]);
             set(&mut evals, f, width, row, i * params.delta + j);
         }
     }
@@ -106,7 +110,7 @@ pub fn form_m_alpha_different_matrices(
 
         // expand with gadget vector
         for j in 0..params.delta {
-            let f = c_i.mul_int(gadget_vec[j]);
+            let f = mul_int_field(gadget_vec[j], c_i);
 
             // set in fourth row section
             set(&mut evals, f, width, row, i * params.delta + j);
@@ -125,13 +129,13 @@ pub fn form_m_alpha_different_matrices(
 
     for i in 0..1 << params.m {
         // get the current coefficient
-        let a_i = u64::multi_lin_coeff(&x[params.r..params.r + params.m], i, params.m, params.q);
+        let a_i = multi_lin_coeff_int(&x[params.r..params.r + params.m], i, params.m, params.q);
 
         // expand with normal gadget vector
         for j in 0..params.delta {
             // expand with gadget matrix for composition of z_hat into z
             for k in 0..params.delta_z {
-                let f = - ExtField::lift_int(a_i * gadget_vec[j] * gadget_vec_z[k]);
+                let f = - lift_int((a_i * gadget_vec[j]) % params.q * gadget_vec_z[k]);
                 set(&mut evals, f, width, row, col_offset + i * params.delta * params.delta_z + j * params.delta_z + k);
             }
         }
@@ -148,17 +152,27 @@ pub fn form_m_alpha_different_matrices(
 
             // expand with gadget vector
             for j in 0..params.delta_z {
-                let f = - cur.mul_int(gadget_vec_z[j]);
+                let f = - mul_int_field(gadget_vec_z[j], cur);
                 set(&mut evals, f, width, row_offset + row, col_offset + col * params.delta_z + j);
             }
         }
     }
 
-    // Set -alpha^d + 1 in the n places
+    // Calculate -alpha^d + 1
     let minus_alpha_d_plus_one = -(alpha_pows[params.d-1] * alpha_pows[1] + alpha_pows[0]);
+
+    // Gadget expand
+    let mut minus_alpha_d_plus_one_expanded = Vec::<ExtField>::new();
+
+    for i in 0..params.delta {
+        minus_alpha_d_plus_one_expanded.push(mul_int_field(gadget_vec[i], minus_alpha_d_plus_one));
+    }
     
+    // Set 
     for i in 0..n {
-        set(&mut evals, minus_alpha_d_plus_one, width, i, mu + i);
+        for j in 0..params.delta {
+            set(&mut evals, minus_alpha_d_plus_one_expanded[j], width, i, mu + i * params.delta + j);
+        }
     }
 
     evals
@@ -175,8 +189,8 @@ pub fn form_m_alpha_same_matrix(
 ) -> Vec<ExtField>
 {
     // We are constructing M (evaluated at alpha) such that M.[z|r] = y.
-    // M'.z = y + (X^d-1).r where M' is the verification matrix for equations from previous part of the protocol.
-    // So M = [M' | (-X^d-1).In], and padded with zeros so its height and width are powers of two.
+    // M'.z = y + (X^d+1).r where M' is the verification matrix for equations from previous part of the protocol.
+    // So M = [M' | (-X^d+1).Gn], and padded with zeros so its height and width are powers of two.
     // Optimise for the case when the commitment matrices are the same.
 
     assert!(params.reuse_mats);
@@ -187,9 +201,9 @@ pub fn form_m_alpha_same_matrix(
     // length of r (height of M')
     let n = params.n + params.n + 1 + 1 + params.n;
 
-    // pad n and (mu + n) to the next power of two
-    let height = 1 << (n as u64).log();
-    let width = 1 << ((mu + n) as u64).log();
+    // pad n and (mu + n*delta) to the next power of two
+    let height = 1 << n.log();
+    let width = 1 << (mu + n * params.delta).log();
 
     // create the vector of evaluations of M_alpha_mle
     let mut evals = vec![ExtField::ZERO; height * width];
@@ -219,7 +233,7 @@ pub fn form_m_alpha_same_matrix(
             let col_offset = params.width_d + params.width_b;
 
             for j in 0..params.delta_z {
-                let f = - f.mul_int(gadget_vec_z[j]);
+                let f = - mul_int_field(gadget_vec_z[j], f);
                 set(&mut evals, f, width, row_offset + row, col_offset + col * params.delta_z + j);
             }
         }
@@ -230,11 +244,11 @@ pub fn form_m_alpha_same_matrix(
 
     for i in 0..1 << params.r {
         // get the current coefficient
-        let b_i = u64::multi_lin_coeff(&x[0..params.r], i, params.r, params.q);
+        let b_i = multi_lin_coeff_int(&x[0..params.r], i, params.r, params.q);
 
         // expand with gadget vector
         for j in 0..params.delta {
-            let f = ExtField::lift_int(b_i * gadget_vec[j]);
+            let f = lift_int(b_i * gadget_vec[j]);
             set(&mut evals, f, width, row, i * params.delta + j);
         }
     }
@@ -250,7 +264,7 @@ pub fn form_m_alpha_same_matrix(
 
         // expand with gadget vector
         for j in 0..params.delta {
-            let f = c_i.mul_int(gadget_vec[j]);
+            let f = mul_int_field(gadget_vec[j], c_i);
 
             // set in fourth row section
             set(&mut evals, f, width, row, i * params.delta + j);
@@ -268,23 +282,33 @@ pub fn form_m_alpha_same_matrix(
 
     for i in 0..1 << params.m {
         // get the current coefficient
-        let a_i = u64::multi_lin_coeff(&x[params.r..params.r + params.m], i, params.m, params.q);
+        let a_i = multi_lin_coeff_int(&x[params.r..params.r + params.m], i, params.m, params.q);
 
         // expand with normal gadget vector
         for j in 0..params.delta {
             // expand with gadget matrix for composition of z_hat into z
             for k in 0..params.delta_z {
-                let f = - ExtField::lift_int(a_i * gadget_vec[j] * gadget_vec_z[k]);
+                let f = - lift_int((a_i * gadget_vec[j]) % params.q * gadget_vec_z[k]);
                 set(&mut evals, f, width, row, col_offset + i * params.delta * params.delta_z + j * params.delta_z + k);
             }
         }
     }
 
-    // Set -alpha^d + 1 in the n places
+    // Calculate -alpha^d + 1
     let minus_alpha_d_plus_one = -(alpha_pows[params.d-1] * alpha_pows[1] + alpha_pows[0]);
+
+    // Gadget expand
+    let mut minus_alpha_d_plus_one_expanded = Vec::<ExtField>::new();
+
+    for i in 0..params.delta {
+        minus_alpha_d_plus_one_expanded.push(mul_int_field(gadget_vec[i], minus_alpha_d_plus_one));
+    }
     
+    // Set 
     for i in 0..n {
-        set(&mut evals, minus_alpha_d_plus_one, width, i, mu + i);
+        for j in 0..params.delta {
+            set(&mut evals, minus_alpha_d_plus_one_expanded[j], width, i, mu + i * params.delta + j);
+        }
     }
 
     evals

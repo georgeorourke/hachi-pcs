@@ -2,20 +2,19 @@ use ark_ff::AdditiveGroup;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 
-use crate::arithmetic::{ExtField, Logarithm, RandFromRng};
+use crate::arithmetic::{ExtField, utils::{Logarithm, rand_int}};
 
-/// Representation of a sparse polynomial which contains exactly k coefficients
+/// Representation of a sparse polynomial challenge which contains exactly k coefficients
 /// with value -1 or 1, and all other coefficients zero.
 /// Store the k non-zero coefficients in a vector of integers where each element 
 /// stores the sign in the LSB and the index in the rest of the bits.
-pub struct SparsePoly {
+pub struct PChal {
     coeffs: Vec<u32>,
 }
 
-/// Random sampling of sparse polynomial.
-impl RandFromRng<(usize, usize)> for SparsePoly {
-    /// Sample a random sparse polynomial with Fisher-Yates-like algorithm given the PRNG.
-    fn rand((d, k): (usize, usize), rng: &mut impl RngCore) -> Self {
+impl PChal {
+    /// Sample a random challenge.
+    pub fn rand(d: usize, k: usize, rng: &mut impl RngCore) -> Self {
         // create array [0, 1, 2, ..., D]
         let mut arr = vec![0u32; d];
 
@@ -27,7 +26,7 @@ impl RandFromRng<(usize, usize)> for SparsePoly {
         for i in 0..k {
             // generate a random number between 0 and 2(d-i)-1
             let n = (d as u64 - i as u64) * 2;
-            let val = u32::rand((n, n.log()), rng);
+            let val = rand_int(n, n.log(), rng) as u32;
 
             let index = (val >> 1) as usize;
             let sign = val & 1;
@@ -48,17 +47,14 @@ impl RandFromRng<(usize, usize)> for SparsePoly {
 
         Self { coeffs : v }
     }
-}
 
-/// General methods.
-impl SparsePoly {
-    /// Generate a vector of random sparse polynomials from the given seed.
+    /// Sample a vector of random challenge polynomials from the given seed.
     pub fn rand_vec(num: usize, d: usize, k: usize, seed: [u8; 32]) -> Vec<Self> {
         let mut vec: Vec<Self> = Vec::with_capacity(num);
         let mut rng = ChaCha12Rng::from_seed(seed);
 
         for _ in 0..num {
-            vec.push(Self::rand((d, k), &mut rng));
+            vec.push(Self::rand(d, k, &mut rng));
         }
 
         vec
@@ -95,13 +91,13 @@ impl SparsePoly {
     }
 }
 
-#[cfg(test)]
-/// Tests for Sparse Poly.
-mod test_sparse_poly {
-    use rand::rng;
-    use ark_ff::Field;
 
-    use crate::arithmetic::Poly;
+#[cfg(test)]
+/// Tests for Challenge Polynomial.
+mod test_pchal {
+    use rand::rng;
+
+    use crate::arithmetic::{poly::Poly, utils::{powers, rand_field}};
 
     use super::*;
 
@@ -109,10 +105,10 @@ mod test_sparse_poly {
     fn test_rand() {
         // generate a random sparse poly
         let mut rng = rng();
-        let p = SparsePoly::rand((1024, 17), &mut rng);
+        let p = PChal::rand(1024, 17, &mut rng);
 
         // check that p has distinct exponents and print the signs for manual inspection
-        fn count(p: &SparsePoly, exp: usize) -> usize {
+        fn count(p: &PChal, exp: usize) -> usize {
             let mut n = 0;
             
             for i in 0..p.k() {
@@ -145,21 +141,21 @@ mod test_sparse_poly {
     fn test_rand_vec() {
         // just test it generates the correct number of elements
         let num = 100;
-        assert_eq!(num, SparsePoly::rand_vec(num, 64, 40, [1u8; 32]).len());
+        assert_eq!(num, PChal::rand_vec(num, 64, 40, [1u8; 32]).len());
     }
 
     #[test]
     fn test_k() {
-        let poly = SparsePoly::rand((1024, 17), &mut rng());
+        let poly = PChal::rand(1024, 17, &mut rng());
         assert_eq!(17, poly.k());
 
-        let poly = SparsePoly::rand((512, 32), &mut rng());
+        let poly = PChal::rand(512, 32, &mut rng());
         assert_eq!(32, poly.k());
     }
 
     #[test]
     fn test_get() {
-        let poly = SparsePoly::rand((1024, 17), &mut rng());
+        let poly = PChal::rand(1024, 17, &mut rng());
         
         for i in 0..poly.k() {
             let (exp, _) = poly.get(i);
@@ -169,8 +165,9 @@ mod test_sparse_poly {
 
     #[test]
     fn test_eval() {
-        let sparse_poly = SparsePoly::rand((1024, 17), &mut rng());
-        let mut poly = vec![0u64; 1024];
+        let d = 1024;
+        let sparse_poly = PChal::rand(d, 17, &mut rng());
+        let mut poly = vec![0u64; d];
 
         // store sparse poly as normal poly
         for i in 0..sparse_poly.k() {
@@ -185,14 +182,10 @@ mod test_sparse_poly {
         }
 
         // get a random evaluation point
-        let alpha = ExtField::rand(0, &mut rng());
+        let alpha = rand_field(4294967197, & mut rng());
 
-        // generate the powers [1, alpha, ..., alpha^7] and calculate the correct evaluation
-        let mut pows: Vec<ExtField> = Vec::new();
-
-        for i in 0..1024 {
-            pows.push(alpha.pow([i]));
-        }
+        // generate the powers [1, alpha, ..., alpha^d-1] and calculate the correct evaluation
+        let pows = powers(alpha, d);
 
         assert_eq!(poly.as_slice().eval(&pows), sparse_poly.eval(&pows));
     }

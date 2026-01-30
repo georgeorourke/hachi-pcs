@@ -4,11 +4,10 @@ use tfhe_ntt::native64::Plan32 as Native;
 #[cfg(feature = "nightly")]
 use tfhe_ntt::native64::Plan52 as Native;
 
-use crate::arithmetic::{PChal, PMat, PMatNtt, PVec};
-use crate::arithmetic::{Multiply, Ntt};
+use crate::arithmetic::{poly_chal::PChal, poly_mat::PMat, poly_mat_ntt::PMatNtt, poly_vec::PVec};
 
-#[cfg(feature = "nightly")]
-use crate::arithmetic::PVecNtt;
+// #[cfg(feature = "nightly")]
+// use crate::arithmetic::PVecNtt;
 
 /// Representation of operations over polynomials Zq[X].
 /// If cyclotomic = True then the operations are over Zq[X]/(X^d+1)
@@ -103,7 +102,7 @@ impl Ring {
     /// has an l1 norm of less than q/2. The product will contain positive
     /// and negative elements, where negative elements are stored as if they
     /// are signed (i.e. using wrapping arithmetic).
-    fn chal_mul_small_poly(&self, chal: &PChal, poly: &[u64], out: &mut [u64]) {
+    pub fn chal_mul_small_poly(&self, chal: &PChal, poly: &[u64], out: &mut [u64]) {
         assert_eq!(self.input_dim, poly.len());
         assert_eq!(self.output_dim, out.len());
 
@@ -133,31 +132,48 @@ impl Ring {
             }
         }
     }
+
+    #[cfg_attr(feature = "stats", time_graph::instrument)]
+    /// Inner product between a vector of integers and a vector of polynomials.
+    pub fn int_vec_mul_poly_vec(&self, int_vec: &Vec<u64>, p_vec: &PVec, out: &mut PVec, index: usize) {
+        assert_eq!(int_vec.len(), p_vec.length());
+
+        for i in 0..p_vec.length() {
+            self.int_mul_poly(int_vec[i], p_vec.element(i), out.mut_element(index));
+        }
+    }
+
+    #[cfg_attr(feature = "stats", time_graph::instrument)]
+    /// Given a sparse challenge polynomial, multiply the vector of
+    /// polynomails by the challenge add the result to out, starting at index.
+    /// 
+    /// Note: the multiplication is only guaranteed for polynomial vectors with
+    /// small coefficients (e.g. a decomposed witness) so that the result
+    /// does not wrap mod q. The result will have coefficients which are both 
+    /// positive and negative (using wrapping arithmetic).
+    pub fn chal_mul_poly_vec(&self, chal: &PChal, poly_vec: &PVec, out: &mut PVec, index: usize) {
+        assert_eq!(poly_vec.length(), out.length());
+
+        for i in 0..poly_vec.length() {
+            self.chal_mul_small_poly(chal, poly_vec.element(i), out.mut_element(index + i));
+        }
+    }
+
+    #[cfg_attr(feature = "stats", time_graph::instrument)]
+    /// Inner product between a vector of challenges and a vector of polynomials.
+    /// Result is added to out at the index provided.
+    pub fn chal_vec_mul_poly_vec(&self, chals: &Vec<PChal>, poly: &PVec, out: &mut PVec, index: usize) {
+        assert_eq!(chals.len(), poly.length());
+
+        for i in 0..poly.length() {
+            self.chal_mul_poly(&chals[i], poly.element(i), out.mut_element(index));
+        }
+    }
 }
 
 #[cfg(not(feature = "nightly"))]
-/// Internal methods.
+/// Non AVX-512 Specific Methods.
 impl Ring {
-    /// Split a polynomial provided as a slice in NTT domain into its components
-    /// as slices.
-    fn _split_ntt<'a, T>(&self, p_ntt: &'a [T]) -> (&'a [T], &'a [T], &'a [T], &'a [T], &'a [T]) {
-        let (p0, tail) = p_ntt.split_at(self.output_dim);
-        let (p1, tail) = tail.split_at(self.output_dim);
-        let (p2, tail) = tail.split_at(self.output_dim);
-        let (p3, p4) = tail.split_at(self.output_dim);
-        (p0, p1, p2, p3, p4)
-    }
-
-    /// Split a polynomial provided as a slice in NTT domain into its components
-    /// as mutable slices.
-    fn _split_ntt_mut<'a, T>(&self, p_ntt: &'a mut [T]) -> (&'a mut [T], &'a mut [T], &'a mut [T], &'a mut [T], &'a mut [T]) {
-        let (p0, tail) = p_ntt.split_at_mut(self.output_dim);
-        let (p1, tail) = tail.split_at_mut(self.output_dim);
-        let (p2, tail) = tail.split_at_mut(self.output_dim);
-        let (p3, p4) = tail.split_at_mut(self.output_dim);
-        (p0, p1, p2, p3, p4)
-    }
-
     #[cfg_attr(feature = "stats", time_graph::instrument)]
     /// Forward NTT on a polynomial provided as a slice.
     fn _fwd(&self, p: &[u64], p0: &mut [u32], p1: &mut [u32], p2: &mut [u32], p3: &mut [u32], p4: &mut [u32]) {
@@ -221,27 +237,73 @@ impl Ring {
         self.native.ntt_3().mul_accumulate(s3, l3, r3);
         self.native.ntt_4().mul_accumulate(s4, l4, r4);
     }
+
+    #[cfg_attr(feature = "stats", time_graph::instrument)]
+    /// Perform forward NTT on a matrix.
+    pub fn mat_fwd_ntt(&self, mat: &PMat, mat_ntt: &mut PMatNtt) {
+        assert_eq!(mat.height(), mat_ntt.height());
+        assert_eq!(mat.width(), mat_ntt.width());
+
+        for i in 0..mat.height() {
+            for j in 0..mat.width() {
+                let (p0, p1, p2, p3, p4) = mat_ntt.mut_element(i, j);
+                self._fwd(mat.element(i, j), p0, p1, p2, p3, p4);
+            }
+        }
+    }
+
+    #[cfg_attr(feature = "stats", time_graph::instrument)]
+    /// Matrix (NTT form) * vector (coefficient form)
+    pub fn mat_mul_vec(&self, mat: &PMatNtt, vec: &PVec, out: &mut PVec, index: usize) {
+        use crate::arithmetic::poly_vec_ntt::PVecNtt;
+
+        assert_eq!(mat.width(), vec.length());
+
+        // Vectors to store forward NTT of elements as required.
+        // Only perform forward NTT on elements as required (rather than the whole vector at the start).
+        // Much quicker (possibly to do with memory access to larger vector).
+        let mut r0 = vec![0u32; self.output_dim];
+        let mut r1 = vec![0u32; self.output_dim];
+        let mut r2 = vec![0u32; self.output_dim];
+        let mut r3 = vec![0u32; self.output_dim];
+        let mut r4 = vec![0u32; self.output_dim];
+
+        // Vector to store product in NTT domain
+        let mut out_ntt = PVecNtt::zero(mat.height(), self.output_dim);
+
+        // Iterate over columns.
+        for col in 0..mat.width() {
+            // Perform forward NTT on corresponding element of the vector.
+            self._fwd(vec.element(col), &mut r0, &mut r1, &mut r2, &mut r3, &mut r4);
+
+            // Iterate over over rows.
+            for row in 0..mat.height() {
+                // Get corresponding element of the matrix.
+                let (l0, l1, l2, l3, l4) = mat.element(row, col);
+
+                // Get corresponding element of the sum.
+                let (s0, s1, s2, s3, s4) = out_ntt.mut_element(row);
+
+                // Pointwise multiplication accumulated in the sum.
+                self._mul_acc(
+                    l0, l1, l2, l3, l4, 
+                    &r0, &r1, &r2, &r3, &r4, 
+                    s0, s1, s2, s3, s4
+                );
+            }
+        }
+
+        // Inverse NTT on the result.
+        for i in 0..out_ntt.length() {
+            let (p0, p1, p2, p3, p4) = out_ntt.mut_element(i);
+            self._inv(out.mut_element(index + i), p0, p1, p2, p3, p4);
+        }
+    }
 }
 
 #[cfg(feature = "nightly")]
-/// Internal methods.
+/// AVX-512 Specific Methods.
 impl Ring {    
-    /// Split a polynomial provided as a slice in NTT domain into its components
-    /// as slices.
-    fn _split_ntt<'a>(&self, p_ntt: &'a [u64]) -> (&'a [u64], &'a [u64], &'a [u64]) {
-        let (p0, tail) = p_ntt.split_at(self.output_dim);
-        let (p1, p2) = tail.split_at(self.output_dim);
-        (p0, p1, p2)
-    }
-
-    /// Split a polynomial provided as a slice in NTT domain into its components
-    /// as mutable slices.
-    fn _split_ntt_mut<'a>(&self, p_ntt: &'a mut [u64]) -> (&'a mut [u64], &'a mut [u64], &'a mut [u64]) {
-        let (p0, tail) = p_ntt.split_at_mut(self.output_dim);
-        let (p1, p2) = tail.split_at_mut(self.output_dim);
-        (p0, p1, p2)
-    }
-
     #[cfg_attr(feature = "stats", time_graph::instrument)]
     /// Forward NTT on a polynomial provided as a slice.
     fn _fwd(&self, p: &[u64], p0: &mut [u64], p1: &mut [u64], p2: &mut [u64]) {
@@ -297,106 +359,24 @@ impl Ring {
         self.native.ntt_1().mul_accumulate(s1, l1, r1);
         self.native.ntt_2().mul_accumulate(s2, l2, r2);
     }
-}
 
-/// Element-wise NTT transform for matrix over the ring.
-impl Ntt<PMat, PMatNtt> for Ring {
-    fn fwd(&self, mat: &PMat, mat_ntt: &mut PMatNtt) {
+    /// Perform forward NTT on a matrix.
+    pub fn mat_fwd_ntt(&self, mat: &PMat, mat_ntt: &mut PMatNtt) {
         assert_eq!(mat.height(), mat_ntt.height());
         assert_eq!(mat.width(), mat_ntt.width());
 
         for i in 0..mat.height() {
             for j in 0..mat.width() {
-                #[cfg(not(feature = "nightly"))]
-                {
-                    let (p0, p1, p2, p3, p4) = self._split_ntt_mut(mat_ntt.mut_element(i, j));
-                    self._fwd(mat.element(i, j), p0, p1, p2, p3, p4);
-                }
-
-                #[cfg(feature = "nightly")]
-                {
-                    let (p0, p1, p2) = self._split_ntt_mut(mat_ntt.mut_element(i, j));
-                    self._fwd(mat.element(i, j), p0, p1, p2);
-                }
+                let (p0, p1, p2) = mat_ntt.mut_element(i, j);
+                self._fwd(mat.element(i, j), p0, p1, p2);
             }
         }
     }
-}
 
-#[cfg(not(feature = "nightly"))]
-/// Multiplication of a matrix of polynomials in NTT form and vector of polynomials in coefficient form
-/// in the ring Zq[X]/(X^d+1). Result is stored in out at the index provided.
-/// 
-/// Note: the coefficients of the vector are treated as if they are signed integers despite
-/// being provided as unsigned integers (use wrapping arithmetic). I.e. the value 2^64 - 1 represents -1.
-/// 
-/// Note: the result is only guaranteed to be valid if the product,
-/// before it is reduced mod q, 'fits in' a 64 bit signed integer.
-/// E.g. if q = 32 bits, d = 10 bits and the maximum coefficient of the vector
-/// is 4 bits then the result (pre mod q reduction) will be 32 + 10 + 4 < 64 bits.
-/// 
-/// In practise, the matrix will have arbitrary coefficients mod q (up to log q bits),
-/// d <= 10 bits and the vector will be decomposed to 4 bits so we are able to use this.
-/// 
-/// The output will contain coefficients in {0,...,q-1}.
-impl Multiply<PMatNtt, PVec, PVec> for Ring {
     #[cfg_attr(feature = "stats", time_graph::instrument)]
-    fn mul(&self, mat: &PMatNtt, vec: &PVec, out: &mut PVec, index: usize) {
-        use crate::arithmetic::{PVecNtt, ZeroWithParams};
-
-        assert_eq!(mat.width(), vec.length());
-
-        // Vectors to store forward NTT of elements as required.
-        // Only perform forward NTT on elements as required (rather than the whole vector at the start).
-        // Much quicker (possibly to do with memory access to larger vector).
-        let mut r0 = vec![0u32; self.output_dim];
-        let mut r1 = vec![0u32; self.output_dim];
-        let mut r2 = vec![0u32; self.output_dim];
-        let mut r3 = vec![0u32; self.output_dim];
-        let mut r4 = vec![0u32; self.output_dim];
-
-        // Vector to store product in NTT domain
-        let mut out_ntt = PVecNtt::zero((mat.height(), self.output_dim));
-
-        // Iterate over columns.
-        for col in 0..mat.width() {
-            // Perform forward NTT on corresponding element of the vector.
-            self._fwd(vec.element(col), &mut r0, &mut r1, &mut r2, &mut r3, &mut r4);
-
-            // Iterate over over rows.
-            for row in 0..mat.height() {
-                // Get corresponding element of the matrix.
-                let l = mat.element(row, col);
-                let (l0, l1, l2, l3, l4) = self._split_ntt(l);
-
-                // Get corresponding element of the sum.
-                let s = out_ntt.mut_element(row);
-                let (s0, s1, s2, s3, s4) = self._split_ntt_mut(s);
-
-                // Pointwise multiplication accumulated in the sum.
-                self._mul_acc(
-                    l0, l1, l2, l3, l4, 
-                    &r0, &r1, &r2, &r3, &r4, 
-                    s0, s1, s2, s3, s4
-                );
-            }
-        }
-
-        // Inverse NTT on the result.
-        for i in 0..out_ntt.length() {
-            let (p0, p1, p2, p3, p4) = self._split_ntt_mut(out_ntt.mut_element(i));
-            self._inv(out.mut_element(index + i), p0, p1, p2, p3, p4);
-        }
-    }
-}
-
-#[cfg(feature = "nightly")]
-/// Multiplication of a matrix of polynomials in NTT form and vector of polynomials in coefficient form
-/// in the ring Zq[X]/(X^d+1). Result is stored in out at the index provided.
-impl Multiply<PMatNtt, PVec, PVec> for Ring {
-    #[cfg_attr(feature = "stats", time_graph::instrument)]
-    fn mul(&self, mat: &PMatNtt, vec: &PVec, out: &mut PVec, index: usize) {
-        use crate::arithmetic::ZeroWithParams;
+    /// Matrix (NTT form) * vector (coefficient form)
+    pub fn mat_mul_vec(&self, mat: &PMatNtt, vec: &PVec, out: &mut PVec, index: usize) {
+        use crate::arithmetic::poly_vec_ntt::PVecNtt;
 
         assert_eq!(mat.width(), vec.length());
 
@@ -407,8 +387,8 @@ impl Multiply<PMatNtt, PVec, PVec> for Ring {
         let mut r1 = vec![0u64; self.output_dim];
         let mut r2 = vec![0u64; self.output_dim];
 
-        // Vector to store product in NTT domain.
-        let mut out_ntt = PVecNtt::zero((mat.height(), self.output_dim));
+        // Vector to store product in NTT domain
+        let mut out_ntt = PVecNtt::zero(mat.height(), self.output_dim);
 
         // Iterate over columns.
         for col in 0..mat.width() {
@@ -418,70 +398,20 @@ impl Multiply<PMatNtt, PVec, PVec> for Ring {
             // Iterate over over rows.
             for row in 0..mat.height() {
                 // Get corresponding element of the matrix.
-                let l = mat.element(row, col);
-                let (l0, l1, l2) = self._split_ntt(l);
+                let (l0, l1, l2) = mat.element(row, col);
 
                 // Get corresponding element of the sum.
-                let s = out_ntt.mut_element(row);
-                let (s0, s1, s2) = self._split_ntt_mut(s);
+                let (s0, s1, s2) = out_ntt.mut_element(row);
 
                 // Pointwise multiplication accumulated in the sum.
-                self._mul_acc(
-                    l0, l1, l2, 
-                    &r0, &r1, &r2, 
-                    s0, s1, s2
-                );
+                self._mul_acc(l0, l1, l2, &r0, &r1, &r2, s0, s1, s2);
             }
         }
 
         // Inverse NTT on the result.
         for i in 0..out_ntt.length() {
-            let (p0, p1, p2) = self._split_ntt_mut(out_ntt.mut_element(i));
+            let (p0, p1, p2) = out_ntt.mut_element(i);
             self._inv(out.mut_element(index + i), p0, p1, p2);
-        }
-    }
-}
-
-/// Inner product between a vector of integers and a vector of polynomials.
-/// Result is added to out at the index provided.
-impl Multiply<Vec<u64>, PVec, PVec> for Ring {
-    #[cfg_attr(feature = "stats", time_graph::instrument)]
-    fn mul(&self, int_vec: &Vec<u64>, p_vec: &PVec, out: &mut PVec, index: usize) {
-        assert_eq!(int_vec.len(), p_vec.length());
-
-        for i in 0..p_vec.length() {
-            self.int_mul_poly(int_vec[i], p_vec.element(i), out.mut_element(index));
-        }
-    }
-}
-
-/// Given a sparse polynomial (challenge), multiply the vector of
-/// polynomails by the challenge add the result to out, starting at index.
-/// 
-/// Note: the multiplication is only guaranteed for polynomial vectors with
-/// small coefficients (e.g. a decomposed witness) so that the result
-/// does not wrap mod q. The result will have  coefficients which are both 
-/// positive and negative (using wrapping arithmetic).
-impl Multiply<PChal, PVec, PVec> for Ring {
-    #[cfg_attr(feature = "stats", time_graph::instrument)]
-    fn mul(&self, chal: &PChal, poly_vec: &PVec, out: &mut PVec, index: usize) {
-        assert_eq!(poly_vec.length(), out.length());
-
-        for i in 0..poly_vec.length() {
-            self.chal_mul_small_poly(chal, poly_vec.element(i), out.mut_element(index + i));
-        }
-    }
-}
-
-/// Inner product between a vector of challenges and a vector of polynomials.
-/// Result is added to out at the index provided.
-impl Multiply<Vec<PChal>, PVec, PVec> for Ring {
-    #[cfg_attr(feature = "stats", time_graph::instrument)]
-    fn mul(&self, chals: &Vec<PChal>, poly: &PVec, out: &mut PVec, index: usize) {
-        assert_eq!(chals.len(), poly.length());
-
-        for i in 0..poly.length() {
-            self.chal_mul_poly(&chals[i], poly.element(i), out.mut_element(index));
         }
     }
 }
@@ -492,10 +422,10 @@ mod test_ring {
     use rand::rng;
 
     use super::*;
-    use crate::arithmetic::{Logarithm, RandFromRng, RandFromSeed, ZeroWithParams};
-
     // use default modulus for all tests.
-    use crate::{arithmetic::{PVecNtt, Poly}, hachi::setup::Q};
+    use crate::hachi::setup::Q;
+    use crate::arithmetic::{poly::Poly, poly_vec::PVec, poly_vec_ntt::PVecNtt};
+    use crate::arithmetic::utils::{rand_int, Logarithm};
 
     const P0: u64 = 0b0011_1111_0101_1010_0000_0000_0000_0001;
     const P1: u64 = 0b0011_1111_0101_1101_0000_0000_0000_0001;
@@ -661,11 +591,274 @@ mod test_ring {
         assert_eq!(expected_cyclotomic, actual);
     }
 
+    #[cfg(not(feature = "nightly"))]
+    #[test]
+    fn test_fwd_inv() {
+        let d = 512;
+        let ring = Ring::init(Q, d, true);
+
+        // do forward NTT
+        let p = PVec::rand(1, d, Q, [1; 32]);
+        let mut ntt = PVecNtt::zero(1, d);
+        let (a0, a1, a2, a3, a4) = ntt.mut_element(0);
+        ring._fwd(p.element(0), a0, a1, a2, a3, a4);
+        
+
+        // do inverse NTT
+        let mut p_out = PVec::zero(1, d);
+        ring._inv(p_out.mut_element(0), a0, a1, a2, a3, a4);
+
+        // check we get the same thing back
+        assert_eq!(p.element(0), p_out.element(0));
+    }
+
+    #[cfg(not(feature = "nightly"))]
+    #[test]
+    fn test_fwd_sum_inv() {
+        let d = 512;
+        let ring = Ring::init(Q, d, true);
+
+        // generate many polynomials and sum them in coefficient form
+        let p_vec = PVec::rand(1024, d, Q, [1; 32]);
+        let mut sum_actual = vec![0u64; d];
+
+        for i in 0..p_vec.length() {
+            let p = p_vec.element(i);
+
+            for j in 0..d {
+                sum_actual[j] = add_64(sum_actual[j], p[j], Q);
+            }
+        }
+
+        // sum them over NTT form
+        let mut p_vec_ntt = PVecNtt::zero(1024, d);
+        let mut s0 = vec![0u32; d];
+        let mut s1 = vec![0u32; d];
+        let mut s2 = vec![0u32; d];
+        let mut s3 = vec![0u32; d];
+        let mut s4 = vec![0u32; d];
+        
+        for i in 0..p_vec.length() {
+            let p = p_vec.element(i);
+
+            // do forward NTT
+            let (a0, a1, a2, a3, a4) = p_vec_ntt.mut_element(i);
+            ring._fwd(p, a0, a1, a2, a3, a4);
+
+            // sum over NTT domains
+            for j in 0..d {
+                s0[j] = add_32(s0[j], a0[j], P0);
+                s1[j] = add_32(s1[j], a1[j], P1);
+                s2[j] = add_32(s2[j], a2[j], P2);
+                s3[j] = add_32(s3[j], a3[j], P3);
+                s4[j] = add_32(s4[j], a4[j], P4);
+            }
+        }
+
+        // do inverse NTT on sum
+        let mut sum_actual = vec![0u64; d];
+        ring._inv(&mut sum_actual, &mut s0, &mut s1, &mut s2, &mut s3, &mut s4);
+
+        // check we get the same thing back
+        assert_eq!(sum_actual, sum_actual);
+    }
+
+    #[cfg(not(feature = "nightly"))]
+    #[test]
+    fn test_fwd_mul_inv() {
+        // Note: multiplication in our ring is only guaranteed if each coefficient of the product does not exceed
+        // 63 bits.
+        let d = 32;
+        let ring = Ring::init(Q, d, true);
+
+        // generate arbitrary element and small element (e.g. as in commitment matrix * decomposed witness)
+        let p_vec_1 = PVec::rand(1, d, Q, [1; 32]);
+        let p_vec_2 = PVec::rand(1, d, 16, [1; 32]);
+
+        let mut mul_expected = vec![0u64; d];
+        poly_mul_cyclotomic(p_vec_1.element(0), p_vec_2.element(0), &mut mul_expected, Q);
+
+        // do forward NTT on both elements
+        let mut a0 = vec![0u32; d];
+        let mut a1 = vec![0u32; d];
+        let mut a2 = vec![0u32; d];
+        let mut a3 = vec![0u32; d];
+        let mut a4 = vec![0u32; d];
+        ring._fwd(p_vec_1.element(0), &mut a0, &mut a1, &mut a2, &mut a3, &mut a4);
+
+        let mut b0 = vec![0u32; d];
+        let mut b1 = vec![0u32; d];
+        let mut b2 = vec![0u32; d];
+        let mut b3 = vec![0u32; d];
+        let mut b4 = vec![0u32; d];       
+        ring._fwd(p_vec_2.element(0), &mut b0, &mut b1, &mut b2, &mut b3, &mut b4);
+
+        // pointwise multiply
+        let mut m0 = vec![0u32; d];
+        let mut m1 = vec![0u32; d];
+        let mut m2 = vec![0u32; d];
+        let mut m3 = vec![0u32; d];
+        let mut m4 = vec![0u32; d];
+
+        for j in 0..d {
+            m0[j] = mul_32(a0[j], b0[j], P0);
+            m1[j] = mul_32(a1[j], b1[j], P1);
+            m2[j] = mul_32(a2[j], b2[j], P2);
+            m3[j] = mul_32(a3[j], b3[j], P3);
+            m4[j] = mul_32(a4[j], b4[j], P4);
+        }
+
+        // do inverse NTT and pointwise product
+        let mut mul_actual = vec![0u64; d];
+        ring._inv(&mut mul_actual, &mut m0, &mut m1, &mut m2, &mut m3, &mut m4);
+
+        assert_eq!(mul_expected, mul_actual);
+    }
+
+    #[cfg(not(feature = "nightly"))]
+    #[test]
+    fn test_mul_acc() {
+        let d = 32;
+        let ring = Ring::init(Q, d, true);
+        let length = 100;
+
+        // generate some random NTT domain polynomials
+        let mut rng = rng();
+        let mut p_vec_ntt_1 = PVecNtt::zero(length, d);
+        let mut p_vec_ntt_2 = PVecNtt::zero(length, d);
+
+        for i in 0..length {
+            let (a0, a1, a2, a3, a4) = p_vec_ntt_1.mut_element(i);
+            let (b0, b1, b2, b3, b4) = p_vec_ntt_2.mut_element(i);
+
+            for j in 0..d {
+                a0[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                a1[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                a2[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                a3[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                a4[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+
+                b0[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                b1[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                b2[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                b3[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+                b4[j] = rand_int(P4, P4.log(), &mut rng) as u32;
+            }
+        }
+
+        // do pointwise product and sum
+        let mut s0 = vec![0u32; d];
+        let mut s1 = vec![0u32; d];
+        let mut s2 = vec![0u32; d];
+        let mut s3 = vec![0u32; d];
+        let mut s4 = vec![0u32; d];
+
+        let mut p0 = vec![0u32; d];
+        let mut p1 = vec![0u32; d];
+        let mut p2 = vec![0u32; d];
+        let mut p3 = vec![0u32; d];
+        let mut p4 = vec![0u32; d];
+
+        for i in 0..p_vec_ntt_1.length() {
+            let (a0, a1, a2, a3, a4) = p_vec_ntt_1.element(i);
+            let (b0, b1, b2, b3, b4) = p_vec_ntt_2.element(i);
+
+            // pointwise multiply and sum
+            for j in 0..d {
+                s0[j] = add_32(s0[j], mul_32(a0[j], b0[j], P0), P0);
+                s1[j] = add_32(s1[j], mul_32(a1[j], b1[j], P1), P1);
+                s2[j] = add_32(s2[j], mul_32(a2[j], b2[j], P2), P2);
+                s3[j] = add_32(s3[j], mul_32(a3[j], b3[j], P3), P3);
+                s4[j] = add_32(s4[j], mul_32(a4[j], b4[j], P4), P4);
+            }
+
+            // use method
+            ring._mul_acc(
+                a0, a1, a2, a3, a4, 
+                b0, b1, b2, b3, b4, 
+                &mut p0, &mut p1, &mut p2, &mut p3, &mut p4);
+        }
+
+        assert_eq!(s0, p0);
+        assert_eq!(s1, p1);
+        assert_eq!(s2, p2);
+        assert_eq!(s3, p3);
+        assert_eq!(s4, p4);
+    }
+
+   #[cfg(feature = "nightly")]
+    #[test]
+    fn test_fwd_inv() {
+        let d = 512;
+        let ring = Ring::init(Q, d, true);
+
+        // do forward NTT
+        let p = PVec::rand(1, d, Q, [1; 32]);
+        let mut ntt = PVecNtt::zero(1, d);
+        let (a0, a1, a2) = ntt.mut_element(0);
+        ring._fwd(p.element(0), a0, a1, a2);
+        
+
+        // do inverse NTT
+        let mut p_out = PVec::zero(1, d);
+        ring._inv(p_out.mut_element(0), a0, a1, a2);
+
+        // check we get the same thing back
+        assert_eq!(p.element(0), p_out.element(0));
+    }
+
+    #[cfg(feature = "nightly")]
+    #[test]
+    fn test_fwd_sum_inv() {
+        let d = 512;
+        let ring = Ring::init(Q, d, true);
+
+        // generate many polynomials and sum them in coefficient form
+        let p_vec = PVec::rand(1024, d, Q, [1; 32]);
+        let mut sum_actual = vec![0u64; d];
+
+        for i in 0..p_vec.length() {
+            let p = p_vec.element(i);
+
+            for j in 0..d {
+                sum_actual[j] = add_64(sum_actual[j], p[j], Q);
+            }
+        }
+
+        // sum them over NTT form
+        let mut p_vec_ntt = PVecNtt::zero(1024, d);
+        let mut s0 = vec![0u64; d];
+        let mut s1 = vec![0u64; d];
+        let mut s2 = vec![0u64; d];
+        
+        for i in 0..p_vec.length() {
+            let p = p_vec.element(i);
+
+            // do forward NTT
+            let (a0, a1, a2) = p_vec_ntt.mut_element(i);
+            ring._fwd(p, a0, a1, a2);
+
+            // sum over NTT domains
+            for j in 0..d {
+                s0[j] = add_64(s0[j], a0[j], P0);
+                s1[j] = add_64(s1[j], a1[j], P1);
+                s2[j] = add_64(s2[j], a2[j], P2);
+            }
+        }
+
+        // do inverse NTT on sum
+        let mut sum_actual = vec![0u64; d];
+        ring._inv(&mut sum_actual, &mut s0, &mut s1, &mut s2);
+
+        // check we get the same thing back
+        assert_eq!(sum_actual, sum_actual);
+    }
+
     #[test]
     fn test_int_mul_poly() {
         let d = 1024;
         let a = 42314u64;
-        let p_vec = PVec::rand((1, d, Q), [1u8; 32]);
+        let p_vec = PVec::rand(1, d, Q, [1u8; 32]);
         let p = p_vec.element(0);
 
         // pad a to be a full polynomial
@@ -693,7 +886,7 @@ mod test_ring {
     fn test_chal_mul_poly() {
         let d = 32;
         let chal_vec = PChal::rand_vec(1, d, 16, [1u8; 32]);
-        let p_vec = PVec::rand((1, d, Q), [1u8; 32]);
+        let p_vec = PVec::rand(1, d, Q, [1u8; 32]);
         let p2 = p_vec.element(0);
 
         // convert sparse poly into full poly
@@ -739,7 +932,7 @@ mod test_ring {
         let chal_vec = PChal::rand_vec(1, d, 16, [1u8; 32]);
 
         // sample a polynomial with coefficients at most 15
-        let p_vec = PVec::rand((1, d, 16), [1u8; 32]);
+        let p_vec = PVec::rand(1, d, 16, [1u8; 32]);
         let p2 = p_vec.element(0);
 
         // convert sparse poly into full poly
@@ -793,593 +986,8 @@ mod test_ring {
         assert_eq!(expected, actual);
     }
 
-    #[cfg(not(feature = "nightly"))]
     #[test]
-    fn test_split_ntt() {
-        let d = 64;
-
-        // non-cyclotomic ring
-        let ring = Ring::init(Q, d, false);
-        let ntt = PVecNtt::rand((1, 2 * d, Q), [1; 32]);
-        let (a0, a1, a2, a3, a4) = ring._split_ntt(ntt.element(0));
-
-        assert_eq!(&ntt.element(0)[0..2 * d], a0);
-        assert_eq!(&ntt.element(0)[2 * d..4 * d], a1);
-        assert_eq!(&ntt.element(0)[4 * d..6 * d], a2);
-        assert_eq!(&ntt.element(0)[6 * d..8 * d], a3);
-        assert_eq!(&ntt.element(0)[8 * d..10 * d], a4);
-
-        // cyclotomic ring
-        let ring = Ring::init(Q, d, true);
-        let ntt = PVecNtt::rand((1, d, Q), [1; 32]);
-        let (a0, a1, a2, a3, a4) = ring._split_ntt(ntt.element(0));
-
-        assert_eq!(&ntt.element(0)[0..d], a0);
-        assert_eq!(&ntt.element(0)[d..2 * d], a1);
-        assert_eq!(&ntt.element(0)[2 * d..3 * d], a2);
-        assert_eq!(&ntt.element(0)[3 * d..4 * d], a3);
-        assert_eq!(&ntt.element(0)[4 * d..5 * d], a4);
-    }
-
-    #[cfg(not(feature = "nightly"))]
-    #[test]
-    fn test_fwd_inv() {
-        use crate::arithmetic::ZeroWithParams;
-
-        let d = 512;
-        let ring = Ring::init(Q, d, true);
-
-        // do forward NTT
-        let p = PVec::rand((1, d, Q), [1; 32]);
-        let mut ntt = PVecNtt::zero((1, d));
-        let (a0, a1, a2, a3, a4) = ring._split_ntt_mut(ntt.mut_element(0));
-        ring._fwd(p.element(0), a0, a1, a2, a3, a4);
-        
-
-        // do inverse NTT
-        let mut p_out = PVec::zero((1, d));
-        ring._inv(p_out.mut_element(0), a0, a1, a2, a3, a4);
-
-        // check we get the same thing back
-        assert_eq!(p.element(0), p_out.element(0));
-    }
-
-    #[cfg(not(feature = "nightly"))]
-    #[test]
-    fn test_fwd_sum_inv() {
-        use crate::arithmetic::ZeroWithParams;
-
-        let d = 512;
-        let ring = Ring::init(Q, d, true);
-
-        // generate many polynomials and sum them in coefficient form
-        let p_vec = PVec::rand((1024, d, Q), [1; 32]);
-        let mut sum_actual = vec![0u64; d];
-
-        for i in 0..p_vec.length() {
-            let p = p_vec.element(i);
-
-            for j in 0..d {
-                sum_actual[j] = add_64(sum_actual[j], p[j], Q);
-            }
-        }
-
-        // sum them over NTT form
-        let mut p_vec_ntt = PVecNtt::zero((1024, d));
-        let mut sum_ntt = vec![0u32; 5 * d];
-        let (s0, s1, s2, s3, s4) = ring._split_ntt_mut(&mut sum_ntt);
-        
-        for i in 0..p_vec.length() {
-            let p = p_vec.element(i);
-
-            // do forward NTT
-            let (a0, a1, a2, a3, a4) = ring._split_ntt_mut(p_vec_ntt.mut_element(i));
-            ring._fwd(p, a0, a1, a2, a3, a4);
-
-            // sum over NTT domains
-            for j in 0..d {
-                s0[j] = add_32(s0[j], a0[j], P0);
-                s1[j] = add_32(s1[j], a1[j], P1);
-                s2[j] = add_32(s2[j], a2[j], P2);
-                s3[j] = add_32(s3[j], a3[j], P3);
-                s4[j] = add_32(s4[j], a4[j], P4);
-            }
-        }
-
-        // do inverse NTT on sum
-        let mut sum_actual = vec![0u64; d];
-        ring._inv(&mut sum_actual, s0, s1, s2, s3, s4);
-
-        // check we get the same thing back
-        assert_eq!(sum_actual, sum_actual);
-    }
-
-    #[cfg(not(feature = "nightly"))]
-    #[test]
-    fn test_fwd_mul_inv() {
-        // Note: multiplication in our ring is only guaranteed if each coefficient of the product does not exceed
-        // 63 bits.
-        let d = 32;
-        let ring = Ring::init(Q, d, true);
-
-        // generate arbitrary element and small element (e.g. as in commitment matrix * decomposed witness)
-        let p_vec_1 = PVec::rand((1, d, Q), [1; 32]);
-        let p_vec_2 = PVec::rand((1, d, 16), [1; 32]);
-
-        let mut mul_expected = vec![0u64; d];
-        poly_mul_cyclotomic(p_vec_1.element(0), p_vec_2.element(0), &mut mul_expected, Q);
-
-        // do forward NTT on both elements
-        let mut a_ntt = vec![0u32; 5 * d];
-        let mut b_ntt = vec![0u32; 5 * d];
-
-        let (a0, a1, a2, a3, a4) = ring._split_ntt_mut(&mut a_ntt);
-        ring._fwd(p_vec_1.element(0), a0, a1, a2, a3, a4);
-
-        let (b0, b1, b2, b3, b4) = ring._split_ntt_mut(&mut b_ntt);
-        ring._fwd(p_vec_2.element(0), b0, b1, b2, b3, b4);
-
-        println!("\n\n\n\n{:?}\n{:?}", a0, b0);
-
-        let mut mul_ntt = vec![0u32; 5 * d];
-        let (m0, m1, m2, m3, m4) = ring._split_ntt_mut(&mut mul_ntt);
-
-        // pointwise multiply
-        for j in 0..d {
-            m0[j] = mul_32(a0[j], b0[j], P0);
-            m1[j] = mul_32(a1[j], b1[j], P1);
-            m2[j] = mul_32(a2[j], b2[j], P2);
-            m3[j] = mul_32(a3[j], b3[j], P3);
-            m4[j] = mul_32(a4[j], b4[j], P4);
-        }
-
-        println!("\n\n\n{:?},\n{:?}\n{:?}\n{:?}\n{:?}", m0, m1, m2, m3, m4);
-
-        // do inverse NTT and pointwise product
-        let mut mul_actual = vec![0u64; d];
-        ring._inv(&mut mul_actual, m0, m1, m2, m3, m4);
-
-        assert_eq!(mul_expected, mul_actual);
-    }
-
-    #[cfg(not(feature = "nightly"))]
-    #[test]
-    fn test_mul_acc() {
-        let d = 32;
-        let ring = Ring::init(Q, d, true);
-        let length = 100;
-
-        // generate some random NTT domain polynomials
-        let p_vec_ntt_1 = PVecNtt::rand((length, d, P4), [1; 32]);
-        let p_vec_ntt_2 = PVecNtt::rand((length, d, P4), [2; 32]);
-
-        // do pointwise product and sum
-        let mut sum_expected = vec![0u32; 5 * d];
-        let (s0, s1, s2, s3, s4) = ring._split_ntt_mut(&mut sum_expected);
-
-        let mut sum_actual = vec![0u32; 5 * d];
-        let (p0, p1, p2, p3, p4) = ring._split_ntt_mut(&mut sum_actual);
-
-        for i in 0..p_vec_ntt_1.length() {
-            let (a0, a1, a2, a3, a4) = ring._split_ntt(p_vec_ntt_1.element(i));
-            let (b0, b1, b2, b3, b4) = ring._split_ntt(p_vec_ntt_2.element(i));
-
-            // pointwise multiply and sum
-            for j in 0..d {
-                s0[j] = add_32(s0[j], mul_32(a0[j], b0[j], P0), P0);
-                s1[j] = add_32(s1[j], mul_32(a1[j], b1[j], P1), P1);
-                s2[j] = add_32(s2[j], mul_32(a2[j], b2[j], P2), P2);
-                s3[j] = add_32(s3[j], mul_32(a3[j], b3[j], P3), P3);
-                s4[j] = add_32(s4[j], mul_32(a4[j], b4[j], P4), P4);
-            }
-
-            // use method
-            ring._mul_acc(
-                a0, a1, a2, a3, a4, 
-                b0, b1, b2, b3, b4, 
-                p0, p1, p2, p3, p4);
-        }
-
-        assert_eq!(sum_expected, sum_actual);
-    }
-
-    #[cfg(feature = "nightly")]
-    #[test]
-    fn test_split_ntt() {
-        let d = 64;
-
-        // non-cyclotomic ring
-        let ring = Ring::init(Q, d, false);
-        let ntt = PVecNtt::rand((1, 2 * d, Q), [1; 32]);
-        let (a0, a1, a2) = ring._split_ntt(ntt.element(0));
-
-        assert_eq!(&ntt.element(0)[0..2 * d], a0);
-        assert_eq!(&ntt.element(0)[2 * d..4 * d], a1);
-        assert_eq!(&ntt.element(0)[4 * d..6 * d], a2);
-
-        // cyclotomic ring
-        let ring = Ring::init(Q, d, true);
-        let ntt = PVecNtt::rand((1, d, Q), [1; 32]);
-        let (a0, a1, a2) = ring._split_ntt(ntt.element(0));
-
-        assert_eq!(&ntt.element(0)[0..d], a0);
-        assert_eq!(&ntt.element(0)[d..2 * d], a1);
-        assert_eq!(&ntt.element(0)[2 * d..3 * d], a2);
-    }
-
-    #[cfg(feature = "nightly")]
-    #[test]
-    fn test_fwd_inv() {
-        let d = 512;
-        let ring = Ring::init(Q, d, true);
-
-        // do forward NTT
-        let p = PVec::rand((1, d, Q), [1; 32]);
-        let mut ntt = PVecNtt::zero((1, d));
-        let (a0, a1, a2) = ring._split_ntt_mut(ntt.mut_element(0));
-        ring._fwd(p.element(0), a0, a1, a2);
-        
-
-        // do inverse NTT
-        let mut p_out = PVec::zero((1, d));
-        ring._inv(p_out.mut_element(0), a0, a1, a2);
-
-        // check we get the same thing back
-        assert_eq!(p.element(0), p_out.element(0));
-    }
-
-    #[cfg(feature = "nightly")]
-    #[test]
-    fn test_fwd_sum_inv() {
-        let d = 512;
-        let ring = Ring::init(Q, d, true);
-
-        // generate many polynomials and sum them in coefficient form
-        let p_vec = PVec::rand((1024, d, Q), [1; 32]);
-        let mut sum_actual = vec![0u64; d];
-
-        for i in 0..p_vec.length() {
-            let p = p_vec.element(i);
-
-            for j in 0..d {
-                sum_actual[j] = add_64(sum_actual[j], p[j], Q);
-            }
-        }
-
-        // sum them over NTT form
-        let mut p_vec_ntt = PVecNtt::zero((1024, d));
-        let mut sum_ntt = vec![0u64; 3 * d];
-        let (s0, s1, s2) = ring._split_ntt_mut(&mut sum_ntt);
-        
-        for i in 0..p_vec.length() {
-            let p = p_vec.element(i);
-
-            // do forward NTT
-            let (a0, a1, a2) = ring._split_ntt_mut(p_vec_ntt.mut_element(i));
-            ring._fwd(p, a0, a1, a2);
-
-            // sum over NTT domains
-            for j in 0..d {
-                s0[j] = add_64(s0[j], a0[j], P0);
-                s1[j] = add_64(s1[j], a1[j], P1);
-                s2[j] = add_64(s2[j], a2[j], P2);
-            }
-        }
-
-        // do inverse NTT on sum
-        let mut sum_actual = vec![0u64; d];
-        ring._inv(&mut sum_actual, s0, s1, s2);
-
-        // check we get the same thing back
-        assert_eq!(sum_actual, sum_actual);
-    }
-
-    #[cfg(feature = "nightly")]
-    #[test]
-    fn test_fwd_mul_inv() {
-        // Note: multiplication in our ring is only guaranteed if each coefficient of the product does not exceed
-        // 63 bits.
-        let d = 1024;
-        let ring = Ring::init(Q, d, true);
-
-        // generate arbitrary element and small element (e.g. as in commitment matrix * decomposed witness)
-        let p_vec_1 = PVec::rand((1, d, Q), [1; 32]);
-        let p_vec_2 = PVec::rand((1, d, 16), [1; 32]);
-
-        let mut mul_expected = vec![0u64; d];
-        poly_mul_cyclotomic(p_vec_1.element(0), p_vec_2.element(0), &mut mul_expected, Q);
-
-        // do forward NTT on both elements
-        let mut a_ntt = vec![0u64; 3 * d];
-        let mut b_ntt = vec![0u64; 3 * d];
-
-        let (a0, a1, a2) = ring._split_ntt_mut(&mut a_ntt);
-        ring._fwd(p_vec_1.element(0), a0, a1, a2);
-
-        let (b0, b1, b2) = ring._split_ntt_mut(&mut b_ntt);
-        ring._fwd(p_vec_2.element(0), b0, b1, b2);
-
-        // poitnwise multiply with concrete NTT function
-        let mut mul_ntt = vec![0u64; 3 * d];
-        let (m0, m1, m2) = ring._split_ntt_mut(&mut mul_ntt);
-
-        ring.native.ntt_0().mul_accumulate(m0, a0, b0);
-        ring.native.ntt_1().mul_accumulate(m1, a1, b1);
-        ring.native.ntt_2().mul_accumulate(m2, a2, b2);
-
-        // do inverse NTT
-        let mut mul_actual = vec![0u64; d];
-        ring._inv(&mut mul_actual, m0, m1, m2);
-
-        assert_eq!(mul_expected, mul_actual);
-
-        // TODO: figure out what the AVX-512 implementation is actually doing.
-        // Coefficients of NTT are bigger than P0, P1, P2 (hence why then need 64 bits not 32)
-        // and mul_accumulate isn't doing a straight pointwise multiplication mod P0, P1, P2 (see below).
-        // Not super important as we can use the methods black-box anyway.
-
-        // pointwise multiply naively
-        let mut test_mul_ntt = vec![0u64; 3 * d];
-        let (t0, t1, t2) = ring._split_ntt_mut(&mut test_mul_ntt);
-
-        for j in 0..d {
-            t0[j] = mul_64(a0[j], b0[j], P0);
-            t1[j] = mul_64(a1[j], b1[j], P1);
-            t2[j] = mul_64(a2[j], b2[j], P2);
-        }
-
-        // assert_eq!(m0, t0);
-        // assert_eq!(m1, t1);
-        // assert_eq!(m2, t2);
-    }
-
-    #[test]
-    fn test_ntt_mat() {
-        let d = 1024;
-        let ring = Ring::init(Q, d, true);
-
-        // sample a random matrix
-        let (h, w) = (4, 32);
-        let mat = PMat::rand((h, w, d, Q), [1; 32]);
-
-        // perform forward NTT
-        let mut mat_ntt = PMatNtt::zero((h, w, d));
-        ring.fwd(&mat, &mut mat_ntt);
-
-        // check each element was processed correctly
-        for i in 0..h {
-            for j in 0..w {
-                #[cfg(not(feature = "nightly"))]
-                {
-                let mut ntt = vec![0u32; 5 * d];
-                let (p0, p1, p2, p3, p4) = ring._split_ntt_mut(&mut ntt);
-                ring.native.fwd(mat.element(i, j), p0, p1, p2, p3, p4);
-
-                assert_eq!(&ntt, mat_ntt.element(i, j));
-                }
-
-                #[cfg(feature = "nightly")]
-                {
-                let mut ntt = vec![0u64; 3 * d];
-                let (p0, p1, p2) = ring._split_ntt_mut(&mut ntt);
-                ring.native.fwd(mat.element(i, j), p0, p1, p2);
-
-                assert_eq!(&ntt, mat_ntt.element(i, j));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn test_mat_prod_vec_cyclotomic() {
-        let d = 512;
-        let ring = Ring::init(Q, d, true);
-
-        // sample a random matrix
-        let (h, w) = (4, 48);
-        let mat = PMat::rand((h, w, d, Q), [1; 32]);
-        
-        // sample a vector with small coefficients
-        let vec = PVec::rand((w, d, 16), [2; 32]);
-        
-        // manually perform matrix * vector
-        let mut prod_expected = PVec::zero((h, d));
-
-        for row in 0..h {
-            let p = prod_expected.mut_element(row);
-
-            for col in 0..w {
-                let m = mat.element(row, col);
-                let v = vec.element(col);
-                
-                let mut prod = vec![0u64; d];
-                poly_mul_cyclotomic(m, v, &mut prod, Q);
-
-                for k in 0..d {
-                    p[k] = add_64(p[k], prod[k], Q);
-                }
-            }
-        }
-
-        // forward NTT on the matrix
-        let mut mat_ntt = PMatNtt::zero((h, w, d));
-        ring.fwd(&mat, &mut mat_ntt);
-
-        // perform product with the ring
-        let mut prod_actual: crate::arithmetic::poly_vec::PolyVec<1, u64> = PVec::zero((h, d));
-        ring.mul(&mat_ntt, &vec, &mut prod_actual, 0);
-
-        // check equal
-        assert_eq!(prod_expected.slice(), prod_actual.slice());
-    }
-
-    #[test]
-    fn test_mat_prod_vec() {
-        let d = 64;
-        let ring = Ring::init(Q, d, false);
-
-        // sample a random matrix
-        let (h, w) = (8, 8);
-        let mat = PMat::rand((h, w, d, Q), [1; 32]);
-        
-        // sample a vector with small coefficients
-        let vec = PVec::rand((w, d, 16), [2; 32]);
-        
-        // manually perform matrix * vector
-        let mut prod_expected = PVec::zero((h, 2 * d));
-
-        for row in 0..h {
-            let p = prod_expected.mut_element(row);
-
-            for col in 0..w {
-                let m = mat.element(row, col);
-                let v = vec.element(col);
-
-                let mut prod = vec![0u64; 2 * d];
-                poly_mul(m, v, &mut prod, Q);
-
-                for k in 0..2 * d {
-                    p[k] = add_64(p[k], prod[k], Q);
-                }
-            }
-        }
-
-        // forward NTT on the matrix
-        let mut mat_ntt = PMatNtt::zero((h, w, 2 * d));
-        ring.fwd(&mat, &mut mat_ntt);
-
-        // perform product with the ring
-        let mut prod_actual = PVec::zero((h, 2 * d));
-        ring.mul(&mat_ntt, &vec, &mut prod_actual, 0);
-
-        // check equal
-        assert_eq!(prod_expected.slice(), prod_actual.slice());
-    }
-
-    #[test]
-    fn test_mat_prod_vec_cyclotomic_negative() {
-        let d = 512;
-        let ring = Ring::init(Q, d, true);
-
-        // sample a random matrix
-        let (h, w) = (4, 48);
-        let mat = PMat::rand((h, w, d, Q), [1; 32]);
-        
-        // sample a vector with small coefficients
-        let mut vec = PVec::rand((w, d, 16), [2; 32]);
-
-        // adjust the coefficients so they're between -8..7 instead of 0..15 (using wrappping arithmetic)
-        let v = vec.mut_slice();
-
-        for i in 0..v.len() {
-            v[i] = v[i].wrapping_sub(8);
-        }
-        
-        // manually perform matrix * vector
-        let mut prod_expected = PVec::zero((h, d));
-
-        for row in 0..h {
-            let p = prod_expected.mut_element(row);
-
-            for col in 0..w {
-                let m = mat.element(row, col);
-                let v = vec.element(col);
-                let mut v_pos = vec![0u64; v.len()];
-
-                // adjust the coefficients of v so that they are between 0..7 and q-8..q-1
-                for i in 0..v.len() {
-                    if (v[i] as i64) < 0 {
-                        v_pos[i] = (Q as i64 + v[i] as i64) as u64;
-                    }
-                    else {
-                        v_pos[i] = v[i];
-                    }
-                }
-                
-                let mut prod = vec![0u64; d];
-                poly_mul_cyclotomic(m, &v_pos, &mut prod, Q);
-
-                for k in 0..d {
-                    p[k] = add_64(p[k], prod[k], Q);
-                }
-            }
-        }
-
-        // forward NTT on the matrix
-        let mut mat_ntt = PMatNtt::zero((h, w, d));
-        ring.fwd(&mat, &mut mat_ntt);
-
-        // perform product with the ring
-        let mut prod_actual: crate::arithmetic::poly_vec::PolyVec<1, u64> = PVec::zero((h, d));
-        ring.mul(&mat_ntt, &vec, &mut prod_actual, 0);
-
-        // check equal
-        assert_eq!(prod_expected.slice(), prod_actual.slice());
-    }
-
-    #[test]
-    fn test_mat_prod_vec_negative() {
-        let d = 1024;
-        let ring = Ring::init(Q, d, false);
-
-        // sample a random matrix
-        let (h, w) = (4, 32);
-        let mat = PMat::rand((h, w, d, Q), [1; 32]);
-        
-        // sample a vector with small-ish coefficients
-        let mut vec = PVec::rand((w, d, 1 << 16), [2; 32]);
-
-        // adjust the coefficients so they're balanced (using wrappping arithmetic)
-        let v = vec.mut_slice();
-
-        for i in 0..v.len() {
-            v[i] = v[i].wrapping_sub(1 << 15);
-        }
-        
-        // manually perform matrix * vector
-        let mut prod_expected = PVec::zero((h, 2 * d));
-
-        for row in 0..h {
-            let p = prod_expected.mut_element(row);
-
-            for col in 0..w {
-                let m = mat.element(row, col);
-                let v = vec.element(col);
-                let mut v_pos = vec![0u64; v.len()];
-
-                // adjust the coefficients of v so that they are between 0..7 and q-8..q-1
-                for i in 0..v.len() {
-                    if (v[i] as i64) < 0 {
-                        v_pos[i] = (Q as i64 + v[i] as i64) as u64;
-                    }
-                    else {
-                        v_pos[i] = v[i];
-                    }
-                }
-                
-                let mut prod = vec![0u64; 2 * d];
-                poly_mul(m, &v_pos, &mut prod, Q);
-
-                for k in 0..2 * d {
-                    p[k] = add_64(p[k], prod[k], Q);
-                }
-            }
-        }
-
-        // forward NTT on the matrix
-        let mut mat_ntt = PMatNtt::zero((h, w, 2 * d));
-        ring.fwd(&mat, &mut mat_ntt);
-
-        // perform product with the ring
-        let mut prod_actual: crate::arithmetic::poly_vec::PolyVec<1, u64> = PVec::zero((h, 2 * d));
-        ring.mul(&mat_ntt, &vec, &mut prod_actual, 0);
-
-        // check equal
-        assert_eq!(prod_expected.slice(), prod_actual.slice());
-    }
-
-    #[test]
-    fn test_inner_prod_int_poly() {
+    fn test_int_vec_mul_poly_vec() {
         let n = 1024;
         let d = 128;
 
@@ -1388,11 +996,11 @@ mod test_ring {
         let mut rng = rng();
 
         for i in 0..n {
-            int_vec[i] = u64::rand((Q, Q.log()), &mut rng);
+            int_vec[i] = rand_int(Q, Q.log(), &mut rng);
         }
 
         // sample a random poly vector
-        let p_vec = PVec::rand((n, d, Q), [1; 32]);
+        let p_vec = PVec::rand(n, d, Q, [1; 32]);
 
         // perform inner product manually
         let mut prod_expected = vec![0u64; 2 * d];
@@ -1416,64 +1024,16 @@ mod test_ring {
 
         // perform inner product with non-cyclotomic ring
         let ring = Ring::init(Q, d, false);
-        let mut prod_actual = PVec::zero((1, 2 * d));
-        ring.mul(&int_vec, &p_vec, &mut prod_actual, 0);
+        let mut prod_actual = PVec::zero(1, 2 * d);
+        ring.int_vec_mul_poly_vec(&int_vec, &p_vec, &mut prod_actual, 0);
         assert_eq!(prod_expected, prod_actual.element(0));
 
         // perform inner product with cyclotomic ring
         let ring = Ring::init(Q, d, true);
-        let mut prod_actual = PVec::zero((1, d));
-        ring.mul(&int_vec, &p_vec, &mut prod_actual, 0);
+        let mut prod_actual = PVec::zero(1, d);
+        ring.int_vec_mul_poly_vec(&int_vec, &p_vec, &mut prod_actual, 0);
         assert_eq!(&prod_expected[0..d], prod_actual.element(0));
 
-    }
-
-    #[test]
-    fn test_chal_mul_poly_vec_cyclotomic() {
-        let n = 128;
-        let d = 256;
-
-        // sample a random challenge
-        let chal_vec = PChal::rand_vec(1, d, 16, [1u8; 32]);
-
-        // convert sparse poly into full poly
-        let mut p1 = vec![0u64; d];
-
-        for i in 0..chal_vec[0].k() {
-            let (exp, sign) = chal_vec[0].get(i);
-            
-            if sign {
-                p1[exp] = 1;
-            }
-            else {
-                p1[exp] = Q.wrapping_sub(1); // -1 mod q;
-            }
-        }
-        
-        // sample a random poly vec with small coefficients
-        let p_vec = PVec::rand((n, d, 16), [1u8; 32]);
-        
-        // manually compute chal*vec
-        let mut prod_expected = PVec::zero((n, d));
-
-        for i in 0..n {
-            let out = prod_expected.mut_element(i);
-            poly_mul_cyclotomic(&p1, p_vec.element(i), out, Q);
-        
-            // adjust to balance coefficients
-            for i in 0..d {
-                if out[i] > (Q >> 1) {
-                    out[i] = out[i].wrapping_sub(Q);
-                }
-            }
-        }
-
-        // compute using ring
-        let ring = Ring::init(Q, d, true);
-        let mut prod_actual = PVec::zero((n, d));
-        ring.mul(&chal_vec[0], &p_vec, &mut prod_actual, 0);
-
-        assert_eq!(prod_expected.slice(), prod_actual.slice());
     }
 
     #[test]
@@ -1482,13 +1042,13 @@ mod test_ring {
         let d = 256;
 
         // sample a random challenge
-        let chal_vec = PChal::rand_vec(1, d, 16, [1u8; 32]);
+        let chal = PChal::rand(d, 16, &mut rng());
 
         // convert sparse poly into full poly
         let mut p1 = vec![0u64; d];
 
-        for i in 0..chal_vec[0].k() {
-            let (exp, sign) = chal_vec[0].get(i);
+        for i in 0..chal.k() {
+            let (exp, sign) = chal.get(i);
             
             if sign {
                 p1[exp] = 1;
@@ -1499,10 +1059,10 @@ mod test_ring {
         }
         
         // sample a random poly vec with small coefficients
-        let p_vec = PVec::rand((n, d, 16), [1u8; 32]);
+        let p_vec = PVec::rand(n, d, 16, [1u8; 32]);
         
         // manually compute chal*vec
-        let mut prod_expected = PVec::zero((n, 2 * d));
+        let mut prod_expected = PVec::zero(n, 2 * d);
 
         for i in 0..n {
             let out = prod_expected.mut_element(i);
@@ -1518,59 +1078,62 @@ mod test_ring {
 
         // compute using ring
         let ring = Ring::init(Q, d, false);
-        let mut prod_actual = PVec::zero((n, 2 * d));
-        ring.mul(&chal_vec[0], &p_vec, &mut prod_actual, 0);
+        let mut prod_actual = PVec::zero(n, 2 * d);
+        ring.chal_mul_poly_vec(&chal, &p_vec, &mut prod_actual, 0);
 
         assert_eq!(prod_expected.slice(), prod_actual.slice());
     }
 
     #[test]
-    fn test_inner_prod_chal_vec_poly_vec_cyclotomic() {
-        let n = 1024;
-        let d = 64;
+    fn test_chal_mul_poly_vec_cyclotomic() {
+        let n = 128;
+        let d = 256;
 
-        // sample a random challenge vector
-        let chal_vec = PChal::rand_vec(n, d, 16, [1u8; 32]);
+        // sample a random challenge
+        let chal = PChal::rand(d, 16, &mut rng());
 
-        // sample a random poly vec
-        let p_vec = PVec::rand((n, d, Q), [1u8; 32]);
+        // convert sparse poly into full poly
+        let mut p1 = vec![0u64; d];
+
+        for i in 0..chal.k() {
+            let (exp, sign) = chal.get(i);
+            
+            if sign {
+                p1[exp] = 1;
+            }
+            else {
+                p1[exp] = Q.wrapping_sub(1); // -1 mod q;
+            }
+        }
         
-        // do inner product manually
-        let mut prod_expected = vec![0u64; d];
+        // sample a random poly vec with small coefficients
+        let p_vec = PVec::rand(n, d, 16, [1u8; 32]);
+        
+        // manually compute chal*vec
+        let mut prod_expected = PVec::zero(n, d);
 
         for i in 0..n {
-            // convert sparse poly into full poly
-            let mut p1 = vec![0u64; d];
-
-            for j in 0..chal_vec[i].k() {
-                let (exp, sign) = chal_vec[i].get(j);
-                
-                if sign {
-                    p1[exp] = 1;
-                }
-                else {
-                    p1[exp] = Q.wrapping_sub(1); // -1 mod q;
+            let out = prod_expected.mut_element(i);
+            poly_mul_cyclotomic(&p1, p_vec.element(i), out, Q);
+        
+            // adjust to balance coefficients
+            for i in 0..d {
+                if out[i] > (Q >> 1) {
+                    out[i] = out[i].wrapping_sub(Q);
                 }
             }
-
-            let mut prod = vec![0u64; d];
-            poly_mul_cyclotomic(&p1, p_vec.element(i), &mut prod, Q);
-
-            for j in 0..d {
-                prod_expected[j] = add_64(prod_expected[j], prod[j], Q)
-            }            
         }
 
-        // do inner product with ring
+        // compute using ring
         let ring = Ring::init(Q, d, true);
-        let mut prod_actual = PVec::zero((1, d));
-        ring.mul(&chal_vec, &p_vec, &mut prod_actual, 0);
+        let mut prod_actual = PVec::zero(n, d);
+        ring.chal_mul_poly_vec(&chal, &p_vec, &mut prod_actual, 0);
 
-        assert_eq!(prod_expected, prod_actual.element(0));
+        assert_eq!(prod_expected.slice(), prod_actual.slice());
     }
 
     #[test]
-    fn test_inner_prod_chal_vec_poly_vec() {
+    fn test_chal_vec_mul_poly_vec() {
         let n = 1024;
         let d = 64;
 
@@ -1578,7 +1141,7 @@ mod test_ring {
         let chal_vec = PChal::rand_vec(n, d, 16, [1u8; 32]);
 
         // sample a random poly vec
-        let p_vec = PVec::rand((n, d, Q), [1u8; 32]);
+        let p_vec = PVec::rand(n, d, Q, [1u8; 32]);
         
         // do inner product manually
         let mut prod_expected = vec![0u64; 2 * d];
@@ -1608,9 +1171,311 @@ mod test_ring {
 
         // do inner product with ring
         let ring = Ring::init(Q, d, false);
-        let mut prod_actual = PVec::zero((1, 2 * d));
-        ring.mul(&chal_vec, &p_vec, &mut prod_actual, 0);
+        let mut prod_actual = PVec::zero(1, 2 * d);
+        ring.chal_vec_mul_poly_vec(&chal_vec, &p_vec, &mut prod_actual, 0);
 
         assert_eq!(prod_expected, prod_actual.element(0));
+    }
+
+    #[test]
+    fn test_chal_vec_mul_poly_vec_cyclotomic() {
+        let n = 1024;
+        let d = 64;
+
+        // sample a random challenge vector
+        let chal_vec = PChal::rand_vec(n, d, 16, [1u8; 32]);
+
+        // sample a random poly vec
+        let p_vec = PVec::rand(n, d, Q, [1u8; 32]);
+        
+        // do inner product manually
+        let mut prod_expected = vec![0u64; d];
+
+        for i in 0..n {
+            // convert sparse poly into full poly
+            let mut p1 = vec![0u64; d];
+
+            for j in 0..chal_vec[i].k() {
+                let (exp, sign) = chal_vec[i].get(j);
+                
+                if sign {
+                    p1[exp] = 1;
+                }
+                else {
+                    p1[exp] = Q.wrapping_sub(1); // -1 mod q;
+                }
+            }
+
+            let mut prod = vec![0u64; d];
+            poly_mul_cyclotomic(&p1, p_vec.element(i), &mut prod, Q);
+
+            for j in 0..d {
+                prod_expected[j] = add_64(prod_expected[j], prod[j], Q)
+            }            
+        }
+
+        // do inner product with ring
+        let ring = Ring::init(Q, d, true);
+        let mut prod_actual = PVec::zero(1, d);
+        ring.chal_vec_mul_poly_vec(&chal_vec, &p_vec, &mut prod_actual, 0);
+
+        assert_eq!(prod_expected, prod_actual.element(0));
+    }
+
+    #[test]
+    fn test_mat_fwd_ntt() {
+        let d = 1024;
+        let ring = Ring::init(Q, d, true);
+
+        // sample a random matrix
+        let (h, w) = (4, 32);
+        let mat = PMat::rand(h, w, d, Q, [1; 32]);
+
+        // perform forward NTT
+        let mut mat_ntt = PMatNtt::zero(h, w, d);
+        ring.mat_fwd_ntt(&mat, &mut mat_ntt);
+
+        // check each element was processed correctly
+        for i in 0..h {
+            for j in 0..w {
+                #[cfg(not(feature = "nightly"))]
+                {
+                let mut p0 = vec![0u32; d];
+                let mut p1 = vec![0u32; d];
+                let mut p2 = vec![0u32; d];
+                let mut p3 = vec![0u32; d];
+                let mut p4 = vec![0u32; d];
+                ring.native.fwd(mat.element(i, j), &mut p0, &mut p1, &mut p2, &mut p3, &mut p4);
+                
+                let (s0, s1, s2, s3, s4) = mat_ntt.element(i, j);
+                assert_eq!(p0, s0);
+                assert_eq!(p1, s1);
+                assert_eq!(p2, s2);
+                assert_eq!(p3, s3);
+                assert_eq!(p4, s4);
+                }
+
+                #[cfg(feature = "nightly")]
+                {
+                let mut p0 = vec![0u64; d];
+                let mut p1 = vec![0u64; d];
+                let mut p2 = vec![0u64; d];
+                ring.native.fwd(mat.element(i, j), &mut p0, &mut p1, &mut p2);
+                
+                let (s0, s1, s2) = mat_ntt.element(i, j);
+                assert_eq!(p0, s0);
+                assert_eq!(p1, s1);
+                assert_eq!(p2, s2);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_mat_mul_vec() {
+        let d = 64;
+        let ring = Ring::init(Q, d, false);
+
+        // sample a random matrix
+        let (h, w) = (8, 8);
+        let mat = PMat::rand(h, w, d, Q, [1; 32]);
+        
+        // sample a vector with small coefficients
+        let vec = PVec::rand(w, d, 16, [2; 32]);
+        
+        // manually perform matrix * vector
+        let mut prod_expected = PVec::zero(h, 2 * d);
+
+        for row in 0..h {
+            let p = prod_expected.mut_element(row);
+
+            for col in 0..w {
+                let m = mat.element(row, col);
+                let v = vec.element(col);
+
+                let mut prod = vec![0u64; 2 * d];
+                poly_mul(m, v, &mut prod, Q);
+
+                for k in 0..2 * d {
+                    p[k] = add_64(p[k], prod[k], Q);
+                }
+            }
+        }
+
+        // forward NTT on the matrix
+        let mut mat_ntt = PMatNtt::zero(h, w, 2 * d);
+        ring.mat_fwd_ntt(&mat, &mut mat_ntt);
+
+        // perform product with the ring
+        let mut prod_actual = PVec::zero(h, 2 * d);
+        ring.mat_mul_vec(&mat_ntt, &vec, &mut prod_actual, 0);
+
+        // check equal
+        assert_eq!(prod_expected.slice(), prod_actual.slice());
+    }
+
+    #[test]
+    fn test_mat_mul_vec_cyclotomic() {
+        let d = 512;
+        let ring = Ring::init(Q, d, true);
+
+        // sample a random matrix
+        let (h, w) = (4, 48);
+        let mat = PMat::rand(h, w, d, Q, [1; 32]);
+        
+        // sample a vector with small coefficients
+        let vec = PVec::rand(w, d, 16, [2; 32]);
+        
+        // manually perform matrix * vector
+        let mut prod_expected = PVec::zero(h, d);
+
+        for row in 0..h {
+            let p = prod_expected.mut_element(row);
+
+            for col in 0..w {
+                let m = mat.element(row, col);
+                let v = vec.element(col);
+                
+                let mut prod = vec![0u64; d];
+                poly_mul_cyclotomic(m, v, &mut prod, Q);
+
+                for k in 0..d {
+                    p[k] = add_64(p[k], prod[k], Q);
+                }
+            }
+        }
+
+        // forward NTT on the matrix
+        let mut mat_ntt = PMatNtt::zero(h, w, d);
+        ring.mat_fwd_ntt(&mat, &mut mat_ntt);
+
+        // perform product with the ring
+        let mut prod_actual = PVec::zero(h, d);
+        ring.mat_mul_vec(&mat_ntt, &vec, &mut prod_actual, 0);
+
+        // check equal
+        assert_eq!(prod_expected.slice(), prod_actual.slice());
+    }
+
+    #[test]
+    fn test_mat_mul_vec_negative() {
+        let d = 1024;
+        let ring = Ring::init(Q, d, false);
+
+        // sample a random matrix
+        let (h, w) = (4, 32);
+        let mat = PMat::rand(h, w, d, Q, [1; 32]);
+        
+        // sample a vector with small-ish coefficients
+        let mut vec = PVec::rand(w, d, 1 << 16, [2; 32]);
+
+        // adjust the coefficients so they're balanced (using wrappping arithmetic)
+        let v = vec.mut_slice();
+
+        for i in 0..v.len() {
+            v[i] = v[i].wrapping_sub(1 << 15);
+        }
+        
+        // manually perform matrix * vector
+        let mut prod_expected = PVec::zero(h, 2 * d);
+
+        for row in 0..h {
+            let p = prod_expected.mut_element(row);
+
+            for col in 0..w {
+                let m = mat.element(row, col);
+                let v = vec.element(col);
+                let mut v_pos = vec![0u64; v.len()];
+
+                // adjust the coefficients of v so that they are between 0..7 and q-8..q-1
+                for i in 0..v.len() {
+                    if (v[i] as i64) < 0 {
+                        v_pos[i] = (Q as i64 + v[i] as i64) as u64;
+                    }
+                    else {
+                        v_pos[i] = v[i];
+                    }
+                }
+                
+                let mut prod = vec![0u64; 2 * d];
+                poly_mul(m, &v_pos, &mut prod, Q);
+
+                for k in 0..2 * d {
+                    p[k] = add_64(p[k], prod[k], Q);
+                }
+            }
+        }
+
+        // forward NTT on the matrix
+        let mut mat_ntt = PMatNtt::zero(h, w, 2 * d);
+        ring.mat_fwd_ntt(&mat, &mut mat_ntt);
+
+        // perform product with the ring
+        let mut prod_actual = PVec::zero(h, 2 * d);
+        ring.mat_mul_vec(&mat_ntt, &vec, &mut prod_actual, 0);
+
+        // check equal
+        assert_eq!(prod_expected.slice(), prod_actual.slice());
+    }
+
+    #[test]
+    fn test_mat_mul_vec_cyclotomic_negative() {
+        let d = 512;
+        let ring = Ring::init(Q, d, true);
+
+        // sample a random matrix
+        let (h, w) = (4, 48);
+        let mat = PMat::rand(h, w, d, Q, [1; 32]);
+        
+        // sample a vector with small coefficients
+        let mut vec = PVec::rand(w, d, 16, [2; 32]);
+
+        // adjust the coefficients so they're between -8..7 instead of 0..15 (using wrappping arithmetic)
+        let v = vec.mut_slice();
+
+        for i in 0..v.len() {
+            v[i] = v[i].wrapping_sub(8);
+        }
+        
+        // manually perform matrix * vector
+        let mut prod_expected = PVec::zero(h, d);
+
+        for row in 0..h {
+            let p = prod_expected.mut_element(row);
+
+            for col in 0..w {
+                let m = mat.element(row, col);
+                let v = vec.element(col);
+                let mut v_pos = vec![0u64; v.len()];
+
+                // adjust the coefficients of v so that they are between 0..7 and q-8..q-1
+                for i in 0..v.len() {
+                    if (v[i] as i64) < 0 {
+                        v_pos[i] = (Q as i64 + v[i] as i64) as u64;
+                    }
+                    else {
+                        v_pos[i] = v[i];
+                    }
+                }
+                
+                let mut prod = vec![0u64; d];
+                poly_mul_cyclotomic(m, &v_pos, &mut prod, Q);
+
+                for k in 0..d {
+                    p[k] = add_64(p[k], prod[k], Q);
+                }
+            }
+        }
+
+        // forward NTT on the matrix
+        let mut mat_ntt = PMatNtt::zero(h, w, d);
+        ring.mat_fwd_ntt(&mat, &mut mat_ntt);
+
+        // perform product with the ring
+        let mut prod_actual = PVec::zero(h, d);
+        ring.mat_mul_vec(&mat_ntt, &vec, &mut prod_actual, 0);
+
+        // check equal
+        assert_eq!(prod_expected.slice(), prod_actual.slice());
     }
 }

@@ -3,18 +3,23 @@ use ark_poly::{DenseMultilinearExtension, Polynomial};
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 
+use crate::arithmetic::ExtField;
 use crate::arithmetic::fs::FS;
-use crate::arithmetic::sumcheck::{Univariate, eq, eq_bin};
-use crate::arithmetic::{ExtField, FieldExtension, Logarithm, MultiLinearCoeff, PChal, PVec, Poly, RandFromRng, powers};
+use crate::arithmetic::poly::Poly;
+use crate::arithmetic::poly_chal::PChal;
+use crate::arithmetic::poly_vec::PVec;
+use crate::arithmetic::sumcheck::Univariate;
+use crate::arithmetic::utils::{Logarithm, eq, eq_bin, lift_int, multi_lin_coeff_int, powers, rand_field};
 
 use crate::hachi::Hachi;
 use crate::hachi::common::form_m_alpha;
-use crate::hachi::evaluate::EvaluationProofRound;
+use crate::hachi::prove::ProofRound;
 use crate::hachi::setup::Parameters;
+
 #[cfg(feature = "verbose")]
 use crate::utils::verbose::tick_item;
 
-/// Verification function.
+/// Verification function for evaluation point over F.
 pub trait Verify<F> {
     /// The verificiation function for the multilinear polynomial.
     fn verify(
@@ -22,7 +27,7 @@ pub trait Verify<F> {
         x: &[u64],
         y: F,
         com: &PVec,
-        proof: &EvaluationProofRound
+        proof: &ProofRound
     );
 }
 
@@ -33,7 +38,7 @@ impl Verify<u64> for Hachi{
         x: &[u64],
         y: u64,
         com : &PVec,
-        proof: &EvaluationProofRound
+        proof: &ProofRound
         ) {
             #[cfg(feature = "verbose")]
             println!("\n==== Verify ====");
@@ -48,7 +53,7 @@ impl Verify<u64> for Hachi{
             let mut v = vec![0u64; params.d];
 
             for i in 0..params.d {
-                v[i] = u64::multi_lin_coeff(x_v, i, log_d, params.q);
+                v[i] = multi_lin_coeff_int(x_v, i, log_d, params.q);
             }
 
             let ring_y = proof.y.slice();
@@ -74,7 +79,7 @@ impl Verify<u64> for Hachi{
             // sample alpha
             fs.push(&proof.u_dash);
             let mut rng = ChaCha12Rng::from_seed(fs.get_seed());
-            let alpha = ExtField::rand(0, &mut rng);
+            let alpha = rand_field(params.q, &mut rng);
 
             // Get the powers of alpha
             let alpha_pows = powers(alpha, params.d);
@@ -98,14 +103,14 @@ impl Verify<u64> for Hachi{
             let mut tau_0 = vec![ExtField::ZERO; num_vars];
             
             for i in 0..num_vars {
-                tau_0[i] = ExtField::rand(0, &mut rng);
+                tau_0[i] = rand_field(params.q, &mut rng);
             }
 
             let log_n = (n as u64).log();
             let mut tau_1 = vec![ExtField::ZERO; log_n];
             
             for i in 0..log_n {
-                tau_1[i] = ExtField::rand(0, &mut rng);
+                tau_1[i] = rand_field(params.q, &mut rng);
             }
 
             // Get expected sum for F_alpha
@@ -116,29 +121,11 @@ impl Verify<u64> for Hachi{
                 &proof.univariates_f_alpha, 
                 &proof.univariates_f_0, 
                 sum_f_alpha, 
-                &mut fs
+                &mut fs,
+                params.q
             );
 
             // Check evaluation of f_0
-            // evaluate indicator polynomial
-            let mut i_r = ExtField::ZERO;
-            let mut prefix = ExtField::ONE;
-
-            let len_z = mu * params.d;
-
-            for i in (0..chals_f_0.len()).rev() {
-                // i-th bit of mu
-                let mu_i = (len_z >> i) & 1;
-
-                if mu_i == 1 {
-                    i_r += prefix * (ExtField::ONE - chals_f_0[i]);
-                    prefix *= chals_f_0[i];
-                }
-                else {
-                    prefix *= ExtField::ONE - chals_f_0[i];
-                }
-            }
-
             // evaluate eq
             let mut eq_r = ExtField::ONE;
             assert_eq!(tau_0.len(), chals_f_0.len());
@@ -148,16 +135,16 @@ impl Verify<u64> for Hachi{
             }
 
             // perform the multiplication v_r=w.(w+b/2).(w-1)(w+1). ... .(w-b/2-1)(w+b/2-1)
-            let mut v_r = proof.y_dash * (proof.y_dash + ExtField::lift_int(params.b / 2));
+            let mut v_r = proof.y_dash * (proof.y_dash + lift_int(params.b / 2));
             
             // multiply with difference of two squares to improve efficiency
             let w_r_squared = proof.y_dash * proof.y_dash;
 
             for r in 1..params.b as usize / 2 { 
-                v_r *= w_r_squared - ExtField::lift_int((r * r) as u64);
+                v_r *= w_r_squared - lift_int((r * r) as u64);
             }
 
-            let f_0_actual = i_r * eq_r * v_r;
+            let f_0_actual = eq_r * v_r;
             assert_eq!(f_0_expected, f_0_actual);
 
             #[cfg(feature = "verbose")]
@@ -194,7 +181,7 @@ impl Verify<u64> for Hachi{
 fn compute_expected_sum_f_alpha(
     params: &Parameters, 
     com: &PVec, 
-    proof: &EvaluationProofRound, 
+    proof: &ProofRound, 
     alpha_pows: &[ExtField], tau_1: &[ExtField]
 ) -> ExtField {
     // evaluate Y=[v u y 0 0] at alpha
@@ -240,7 +227,8 @@ fn sumcheck_verify(
     univariates_f_alpha: &Vec<Univariate<ExtField>>, 
     univariates_f_0: &Vec<Univariate<ExtField>>,
     sum_f_alpha: ExtField,
-    fs: &mut FS
+    fs: &mut FS,
+    q: u64
 ) -> (ExtField, ExtField, Vec<ExtField>, Vec<ExtField>) {
     // get the number of rounds
     let rounds_f_0 = univariates_f_0.len();
@@ -265,7 +253,7 @@ fn sumcheck_verify(
         // sample the challenge
         fs.push(&univariate_f_alpha);
         let mut rng = ChaCha12Rng::from_seed(fs.get_seed());
-        let r = ExtField::rand(0, &mut rng);
+        let r = rand_field(q, &mut rng);
         challenges_f_alpha.push(r);
 
         // update the expected binary sum
@@ -287,7 +275,7 @@ fn sumcheck_verify(
         fs.push(&univariate_f_alpha);
         fs.push(&univariate_f_0);
         let mut rng = ChaCha12Rng::from_seed(fs.get_seed());
-        let r = ExtField::rand(0, &mut rng);
+        let r = rand_field(q, &mut rng);
         challenges_f_alpha.push(r);
         challenges_f_0.push(r);
 

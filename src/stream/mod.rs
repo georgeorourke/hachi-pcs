@@ -1,5 +1,4 @@
 pub mod file_stream;
-pub mod vec_stream;
 
 /// Representation of a stream of data from some source.
 pub trait Stream<T> {

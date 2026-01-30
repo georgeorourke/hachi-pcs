@@ -70,14 +70,14 @@ impl Setup for Hachi {
         let decomp_witness = decompose;
         let z_bound = Z_BOUND;
         let b = DECOMP_BASE;
-        let delta = if decompose { DECOMP_DELTA } else { 1 };
+        let delta = DECOMP_DELTA;
         let delta_z = Z_DECOMP_DELTA;
 
         // height of matrices - we require height * ring dimension at least 2^10
         let n = 1 << (10-alpha);
 
         // width of matrices
-        let width_a = (1 << m) * delta;
+        let width_a = if decomp_witness {(1 << m) * delta } else { 1 << m };
         let width_b = n * (1 << r) * delta;
         let width_d = (1 << r) * delta;
         let reuse_mats = width_a == width_b && width_b == width_d;
